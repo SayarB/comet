@@ -15,6 +15,39 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 use zeron_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel};
 
+pub(crate) const AUTO_SMART_ID: &str = "auto-smart";
+
+/// Cursor advertises Auto on the wire as `default` (or `default[]` exploded),
+/// not `auto-smart`. That row is a real model — unlike Claude's duplicate
+/// "Default (recommended)" alias.
+pub(crate) fn is_cursor_auto_wire(id: &str, label: &str) -> bool {
+    strip_variant_suffix(id).eq_ignore_ascii_case("default")
+        && clean_label(label).0.eq_ignore_ascii_case("auto")
+}
+
+/// Map a wire model config value to the picker id (`default` → `auto-smart`).
+pub(crate) fn wire_model_picker_id(id: &str) -> String {
+    if strip_variant_suffix(id).eq_ignore_ascii_case("default") {
+        AUTO_SMART_ID.to_owned()
+    } else {
+        strip_variant_suffix(id).to_owned()
+    }
+}
+
+/// Map a saved picker id to the wire value Cursor's session advertises.
+pub(crate) fn wire_model_value(requested: &str, available: &[&str]) -> Option<String> {
+    if is_auto_smart(requested) {
+        return available
+            .iter()
+            .find(|id| strip_variant_suffix(id).eq_ignore_ascii_case("default"))
+            .map(|id| (*id).to_owned());
+    }
+    available
+        .iter()
+        .find(|id| **id == requested)
+        .map(|id| (*id).to_owned())
+}
+
 /// Strip Cursor's effort-badge HTML from a model name and return the plain
 /// label plus the badge text when present.
 ///
@@ -331,7 +364,7 @@ fn thought_ladder(option: &Value) -> Option<Vec<ReasoningLevel>> {
 }
 
 fn is_auto_smart(id: &str) -> bool {
-    strip_variant_suffix(id) == "auto-smart"
+    strip_variant_suffix(id) == AUTO_SMART_ID
 }
 
 /// Majority base ids (no `[key=value]` suffix) → parameterized picker.
@@ -373,7 +406,7 @@ fn enrich_parameterized(
         .find(|o| o.get("id").and_then(Value::as_str) == Some("optimize_for"))
         .and_then(model_option_from_config)
         .unwrap_or_else(|| optimize_for_option(option_current(options, "optimize_for")));
-    let current_id = option_current(options, "model").map(strip_variant_suffix);
+    let current_id = option_current(options, "model").map(wire_model_picker_id);
     let current_extras: Vec<ModelOption> = options
         .iter()
         .filter(|o| {
@@ -402,7 +435,11 @@ fn enrich_parameterized(
         .map(|mut model| {
             let (label, _) = clean_label(&model.label);
             model.label = label;
-            model.id = strip_variant_suffix(&model.id).to_owned();
+            model.id = if is_cursor_auto_wire(&model.id, &model.label) {
+                AUTO_SMART_ID.to_owned()
+            } else {
+                strip_variant_suffix(&model.id).to_owned()
+            };
             // Discovery clones the current model's wire traits onto every
             // row; those are wrong under parameterized mode.
             model.options.clear();
@@ -411,7 +448,7 @@ fn enrich_parameterized(
             if is_auto_smart(&model.id) {
                 model.options.push(optimize.clone());
             }
-            if current_id == Some(model.id.as_str()) {
+            if current_id.as_deref() == Some(model.id.as_str()) {
                 model.options.extend(current_extras.iter().cloned());
                 model
                     .options
@@ -499,6 +536,9 @@ fn enrich_exploded(models: Vec<Model>, mode_current: Option<&str>) -> Vec<Model>
         }
 
         for (_, mut model) in annotated {
+            if is_cursor_auto_wire(&model.id, &model.label) {
+                model.id = AUTO_SMART_ID.to_owned();
+            }
             // Locked single-variant params stay on the description; Mode is
             // the one trait every Cursor row can actually change.
             model.options.insert(0, mode.clone());
@@ -656,6 +696,28 @@ mod tests {
     }
 
     #[test]
+    fn wire_auto_row_maps_to_auto_smart() {
+        let models = enrich_models(
+            vec![Model {
+                id: "default".into(),
+                label: "Auto".into(),
+                description: None,
+                reasoning_levels: vec![],
+                options: vec![],
+            }],
+            &json!({
+                "configOptions": [
+                    { "id": "mode", "category": "mode", "currentValue": "agent" },
+                    { "id": "model", "category": "model", "currentValue": "default" },
+                ]
+            }),
+        );
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, AUTO_SMART_ID);
+        assert!(models[0].options.iter().any(|o| o.id == "optimize_for"));
+    }
+
+    #[test]
     fn parameterized_catalog_injects_optimize_for_on_auto_only() {
         let models = enrich_models(
             vec![
@@ -724,6 +786,19 @@ mod tests {
         let opus = models.iter().find(|m| m.id == "claude-opus-5").unwrap();
         assert!(opus.options.iter().all(|o| o.id == "mode"));
         assert!(opus.reasoning_levels.is_empty());
+    }
+
+    #[test]
+    fn wire_model_value_maps_auto_smart_to_default() {
+        let available = ["default", "composer-2.5"];
+        assert_eq!(
+            wire_model_value(AUTO_SMART_ID, &available).as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            wire_model_value("composer-2.5", &available).as_deref(),
+            Some("composer-2.5")
+        );
     }
 
     #[test]

@@ -347,6 +347,25 @@ enum ModelRail {
     Harness,
 }
 
+/// Which rail to show when the model picker opens. Favorites-first matches
+/// t3, but fall back to the harness catalog when that view would hide the
+/// resolved pick (Cursor Auto is often unstarred).
+fn initial_model_rail(
+    harness_locked: bool,
+    has_favorites: bool,
+    selected_id: Option<&str>,
+    favorite_ids: &[String],
+) -> ModelRail {
+    if harness_locked || !has_favorites || favorite_ids.is_empty() {
+        return ModelRail::Harness;
+    }
+    if selected_id.is_some_and(|id| favorite_ids.iter().any(|f| f == id)) {
+        ModelRail::Favorites
+    } else {
+        ModelRail::Harness
+    }
+}
+
 /// One row of the model list: the model plus the harness it belongs to —
 /// search results and the favorites view mix harnesses, and every row's
 /// subline names its harness (t3code ModelListRow `showProvider`).
@@ -784,13 +803,33 @@ impl Pickers {
         // Prime the model picker's rail BEFORE anchoring the highlight (the
         // visible rows depend on it): the favorites view when stars exist —
         // t3 ModelPickerContent's initial selection — else the effective
-        // harness. Locked chats stay on their own harness.
+        // harness. Locked chats stay on their own harness. Fall back to the
+        // harness catalog when favorites wouldn't show the resolved pick (e.g.
+        // Cursor Auto before it's starred).
         if kind == PickerKind::HarnessModel {
-            self.model_rail = if !self.harness_locked(cx) && !self.defaults.favorites.is_empty() {
-                ModelRail::Favorites
-            } else {
-                ModelRail::Harness
-            };
+            let favorite_ids: Vec<String> = self
+                .rail_descriptors(cx)
+                .iter()
+                .flat_map(|descriptor| {
+                    self.models
+                        .get(&descriptor.id)
+                        .and_then(|slot| slot.ready())
+                        .into_iter()
+                        .flat_map(|models| {
+                            models.iter().filter_map(|model| {
+                                self.defaults
+                                    .is_favorite(descriptor.id, &model.id)
+                                    .then(|| model.id.clone())
+                            })
+                        })
+                })
+                .collect();
+            self.model_rail = initial_model_rail(
+                self.harness_locked(cx),
+                !self.defaults.favorites.is_empty(),
+                self.selected_model(cx).map(|m| m.id.as_str()),
+                &favorite_ids,
+            );
         }
         // The keyboard-nav highlight starts ON the selected row — row 0
         // otherwise reads as a second active row (user report).
@@ -3236,7 +3275,11 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
         .into_iter()
         .filter_map(|mut model| {
             if has_real && model.id.eq_ignore_ascii_case("default") {
-                return None;
+                if harness == HarnessId::Cursor && model.label.eq_ignore_ascii_case("auto") {
+                    model.id = "auto-smart".into();
+                } else {
+                    return None;
+                }
             }
             if let Some(base) = strip_1m(&model.id.clone()) {
                 if ids.iter().any(|other| other == base) {
@@ -3667,6 +3710,37 @@ mod tests {
         // Idempotent over a clean list.
         let clean = vec![bare_model("titan-5", "Titan 5")];
         assert_eq!(normalize_model_rows(HarnessId::Codex, clean.clone()), clean);
+    }
+
+    #[test]
+    fn initial_model_rail_falls_back_when_pick_is_not_starred() {
+        assert_eq!(
+            initial_model_rail(false, true, Some("auto-smart"), &["composer-2.5".into()]),
+            ModelRail::Harness
+        );
+        assert_eq!(
+            initial_model_rail(false, true, Some("auto-smart"), &["auto-smart".into()]),
+            ModelRail::Favorites
+        );
+        assert_eq!(initial_model_rail(false, true, Some("auto-smart"), &[]), ModelRail::Harness);
+    }
+
+    #[test]
+    fn normalize_keeps_cursor_auto_and_maps_to_auto_smart() {
+        let models = normalize_model_rows(
+            HarnessId::Cursor,
+            vec![
+                bare_model("default", "Auto"),
+                bare_model("composer-2.5", "Composer 2.5"),
+                bare_model("claude-opus-5", "Opus 5"),
+                bare_model("grok-4.6", "Grok 4.6"),
+            ],
+        );
+        assert_eq!(models.len(), 4);
+        assert_eq!(models[0].id, "auto-smart");
+        assert_eq!(models[0].label, "Auto");
+        assert_eq!(models[1].id, "composer-2.5");
+        assert_eq!(models[2].id, "claude-opus-5");
     }
 
     #[test]
