@@ -57,6 +57,28 @@ mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
+#[derive(Clone, Copy)]
+enum EditorTarget {
+    Cursor,
+    Zed,
+}
+
+impl EditorTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cursor => "Cursor",
+            Self::Zed => "Zed",
+        }
+    }
+
+    fn command(self) -> &'static str {
+        match self {
+            Self::Cursor => "cursor",
+            Self::Zed => "zed",
+        }
+    }
+}
+
 actions!(
     shell,
     [ToggleSidebar, ToggleChanges, AddSpacePalette, NewSession]
@@ -828,6 +850,8 @@ pub struct Shell {
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, zeron_proto::SessionStatus>,
     user_menu: popover::Popup<()>,
+    /// "Open project in…" menu in the selected session's titlebar.
+    editor_menu: popover::Popup<()>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
@@ -1049,6 +1073,7 @@ impl Shell {
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
+            editor_menu: popover::Popup::default(),
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
@@ -1759,6 +1784,13 @@ impl Shell {
     fn close_user_menu(&mut self, cx: &mut Context<Self>) {
         if self.user_menu.begin_close() {
             popover::reap_popup(cx, |shell: &mut Self| &mut shell.user_menu);
+            cx.notify();
+        }
+    }
+
+    fn close_editor_menu(&mut self, cx: &mut Context<Self>) {
+        if self.editor_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.editor_menu);
             cx.notify();
         }
     }
@@ -6101,7 +6133,7 @@ fn header_icon_button(
     icon_path: &'static str,
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     let muted = theme.text_muted;
     let fade_key = format!("header-icon-{id}");
     div()
