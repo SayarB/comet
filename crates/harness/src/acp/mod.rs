@@ -839,17 +839,22 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
         // `default` is an ALIAS row (Claude Code's "Default (recommended)"),
         // duplicating whichever real model the CLI resolves it to — dropped
         // whenever a real row exists (it read as clutter in the picker, user
-        // request). Send-side, a chat that saved `default` still matches the
-        // advertised value exactly.
+        // request). Cursor's Auto is also wire id `default`, but labeled "Auto"
+        // — that row is kept and normalized to `auto-smart` in enrichment.
+        // Send-side, a chat that saved `default` still matches the advertised
+        // value exactly.
         let has_real = raw_ids.iter().any(|id| norm_id(id) != "default");
         return model_select
             .iter()
             .filter_map(|o| {
                 let id = o.get("value").and_then(Value::as_str)?;
-                if has_real && norm_id(id) == "default" {
+                let name = o.get("name").and_then(Value::as_str);
+                if has_real
+                    && norm_id(id) == "default"
+                    && !cursor::is_cursor_auto_wire(id, name.unwrap_or(""))
+                {
                     return None;
                 }
-                let name = o.get("name").and_then(Value::as_str);
                 let description = o.get("description").and_then(Value::as_str);
                 let mut options = wire_options.clone();
                 if let Some(base) = strip_context_hint(id) {
@@ -1272,12 +1277,13 @@ fn config_option_sets(
                 // Parameterized Cursor uses base ids; a saved exploded id
                 // (`auto-smart[optimize_for=cost]`) still has to match. When
                 // the catalog is still exploded, effort siblings switch via
-                // `pick_model_id`.
+                // `pick_model_id`. Cursor advertises Auto as wire id `default`.
                 let requested = model.map(cursor::strip_variant_suffix);
                 requested
                     .and_then(|m| cursor::pick_model_id(m, efforts, &available))
                     .or_else(|| requested.and_then(|m| pick_model_value(m, &available, context_1m)))
                     .or_else(|| model.and_then(|m| pick_model_value(m, &available, context_1m)))
+                    .or_else(|| requested.and_then(|m| cursor::wire_model_value(m, &available)))
                     .map(Value::String)
             }
             // Unattended parity with the retired custom adapters (claude
@@ -3421,7 +3427,110 @@ mod tests {
     }
 
     #[test]
+    fn cursor_discovery_keeps_auto_from_default_wire_row() {
+        let session = json!({
+            "sessionId": "s-1",
+            "configOptions": [
+                { "id": "mode", "category": "mode", "currentValue": "agent" },
+                {
+                    "id": "model",
+                    "category": "model",
+                    "currentValue": "composer-2.5",
+                    "options": [
+                        { "value": "default", "name": "Auto" },
+                        { "value": "composer-2.5", "name": "Composer 2.5" },
+                    ],
+                },
+            ],
+        });
+        let models = cursor::enrich_models(models_from_session(&session, &[]), &session);
+        let auto = models
+            .iter()
+            .find(|m| m.id == cursor::AUTO_SMART_ID)
+            .expect("Auto must survive discovery");
+        assert_eq!(auto.label, "Auto");
+        assert!(auto.options.iter().any(|o| o.id == "optimize_for"));
+    }
+
+    #[test]
+    fn models_from_session_keeps_cursor_auto_default_row() {
+        let response = json!({
+            "sessionId": "s-1",
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "composer-2.5",
+                "options": [
+                    { "value": "default", "name": "Auto" },
+                    { "value": "composer-2.5", "name": "Composer 2.5" },
+                ],
+            }],
+        });
+        let models = models_from_session(&response, &[]);
+        assert!(
+            models.iter().any(|m| m.id == "default" && m.label == "Auto"),
+            "{models:?}"
+        );
+    }
+
+    #[test]
     fn cursor_optimize_for_sets_on_parameterized_auto() {
+        let cursor = json!({
+            "sessionId": "s-1",
+            "configOptions": [{
+                "id": "mode",
+                "category": "mode",
+                "type": "select",
+                "currentValue": "agent",
+                "options": [
+                    { "value": "agent" },
+                    { "value": "plan" },
+                    { "value": "ask" },
+                ],
+            }, {
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "composer-2.5",
+                "options": [
+                    { "value": "default", "name": "Auto" },
+                    { "value": "composer-2.5" },
+                ],
+            }, {
+                "id": "optimize_for",
+                "category": "model_config",
+                "type": "select",
+                "currentValue": "balanced",
+                "options": [
+                    { "value": "intelligence" },
+                    { "value": "balanced" },
+                    { "value": "cost" },
+                ],
+            }],
+        });
+        let mut opts = serde_json::Map::new();
+        opts.insert("optimize_for".into(), json!("cost"));
+        let sets = config_option_sets(
+            &cursor,
+            Some("auto-smart[optimize_for=balanced]"),
+            &[],
+            &opts,
+        );
+        assert!(
+            sets.iter()
+                .any(|(id, v)| id == "model" && v == &json!({ "value": "default" })),
+            "{sets:?}"
+        );
+        assert!(
+            sets.iter()
+                .any(|(id, v)| id == "optimize_for" && v == &json!({ "value": "cost" })),
+            "{sets:?}"
+        );
+    }
+
+    #[test]
+    fn cursor_optimize_for_sets_on_auto_smart_wire_id() {
         let cursor = json!({
             "sessionId": "s-1",
             "configOptions": [{
