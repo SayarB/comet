@@ -8,6 +8,123 @@
 use super::*;
 
 impl Shell {
+    fn open_project_in_editor(
+        &mut self,
+        editor: EditorTarget,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_editor_menu(cx);
+
+        let mut command = if cfg!(target_os = "macos") {
+            let mut command = std::process::Command::new("open");
+            command.args(["-a", editor.label()]).arg(&path);
+            command
+        } else {
+            let mut command = std::process::Command::new(editor.command());
+            command.arg(&path);
+            command
+        };
+        let result = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        match result {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                self.sidebar_notice = Some(
+                    format!(
+                        "Could not open {path} in {} (exit status {status}).",
+                        editor.label()
+                    )
+                    .into(),
+                );
+            }
+            Err(err) => {
+                self.sidebar_notice =
+                    Some(format!("Could not open {path} in {}: {err}", editor.label()).into());
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_editor_trigger(
+        &mut self,
+        path: String,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut trigger = header_icon_button(
+            "open-in-editor",
+            icons::COMMAND,
+            theme,
+            cx.listener(|this, _, _, cx| {
+                if this.editor_menu.take_press_was_open() {
+                    this.close_editor_menu(cx);
+                } else {
+                    this.editor_menu.open(());
+                    cx.notify();
+                }
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, _| this.editor_menu.note_trigger_press()),
+        );
+
+        if self.editor_menu.get().is_some() {
+            let closing = self.editor_menu.closing_since();
+            let cursor_path = path.clone();
+            let zed_path = path;
+            let menu = popover::popover_card(theme)
+                .w(px(170.0))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.close_editor_menu(cx);
+                }))
+                .flex()
+                .flex_col()
+                .child(
+                    popover::menu_row(theme, false, "open-in-cursor")
+                        .id("open-in-cursor")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_project_in_editor(
+                                EditorTarget::Cursor,
+                                cursor_path.clone(),
+                                cx,
+                            )
+                        }))
+                        .child(
+                            icon(icons::CURSOR_MARK)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Open in Cursor")),
+                )
+                .child(
+                    popover::menu_row(theme, false, "open-in-zed")
+                        .id("open-in-zed")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_project_in_editor(EditorTarget::Zed, zed_path.clone(), cx)
+                        }))
+                        .child(
+                            icon(icons::COMMAND)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Open in Zed")),
+                )
+                .into_any_element();
+            trigger = trigger.child(popover::anchored_menu_below(
+                "open-in-editor-menu",
+                menu,
+                closing,
+            ));
+        }
+        trigger.into_any_element()
+    }
+
     /// Boot landing: the most recently active visible chat once the first
     /// chats frame has synced (manual selection wins; no chats → the
     /// new-session canvas shows).
@@ -31,8 +148,16 @@ impl Shell {
     /// Open a session from the sidebar: select it, the main area follows.
     pub(super) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.route = Route::Chat;
+        let switching = self.state.read(cx).selected_chat.as_deref() != Some(chat_id.as_str());
         self.state
             .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
+        // A preview belongs to the session that opened it. Close it here —
+        // not only from the AppState observer — because this click is already
+        // a Shell update, and gpui may not re-enter that observer until a
+        // later notify (so the overlay would sit on the new transcript).
+        if switching {
+            self.file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
+        }
         cx.notify();
     }
 
@@ -55,6 +180,7 @@ impl Shell {
             }
             s.select_chat(None, cx);
         });
+        self.file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
         cx.notify();
     }
 
@@ -69,34 +195,43 @@ impl Shell {
         // drag region, and buttons. A session appends its target as a muted
         // "project @ device" tag right of the title (the composer footer no
         // longer carries it).
-        let (title, target, harness, on_canvas): (
+        let (title, target, harness, editor_path, on_canvas): (
             SharedString,
             Option<SharedString>,
             Option<zeron_proto::HarnessId>,
+            Option<String>,
             bool,
         ) = {
             let state = self.state.read(cx);
             match state.selected_chat_row() {
                 Some(chat) => {
-                    let folder = chat
-                        .space_id
-                        .as_deref()
-                        .and_then(|id| state.space_row(id))
+                    let space = chat.space_id.as_deref().and_then(|id| state.space_row(id));
+                    let folder = space
                         .map(|s| s.display_name().to_string())
                         .unwrap_or_else(|| "~".to_string());
                     let device = state
                         .device_name(&chat.device_id)
                         .unwrap_or("Unknown device");
+                    let editor_path = (state.local_device_id.as_deref()
+                        == Some(chat.device_id.as_str()))
+                    .then(|| {
+                        chat.cwd
+                            .clone()
+                            .or_else(|| space.map(|space| space.path.clone()))
+                    })
+                    .flatten()
+                    .filter(|path| path != "~");
                     (
                         SharedString::from(transcript::single_line(
                             &chat.title.clone().unwrap_or_else(|| "New session".into()),
                         )),
                         Some(SharedString::from(format!("{folder} @ {device}"))),
                         chat.config.as_ref().map(|c| c.harness),
+                        editor_path,
                         false,
                     )
                 }
-                None => (SharedString::from(""), None, None, true),
+                None => (SharedString::from(""), None, None, None, true),
             }
         };
 
@@ -275,6 +410,11 @@ impl Shell {
                 )
             })
             .child(div().flex_1())
+            .children(
+                (!takeover)
+                    .then(|| editor_path.map(|path| self.render_editor_trigger(path, &theme, cx)))
+                    .flatten(),
+            )
             .children(trailing);
 
         // The unified window titlebar: full-width on the glass shell, ABOVE

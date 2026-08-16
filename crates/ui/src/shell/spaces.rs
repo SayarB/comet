@@ -152,6 +152,7 @@ impl Shell {
             s.select_space(Some(space_id), cx);
             s.select_chat(None, cx);
         });
+        self.file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
         self.schedule_save(cx);
         cx.notify();
     }

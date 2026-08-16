@@ -2802,6 +2802,8 @@ impl Transcript {
                     copy: Some(self.copy_ui_for(&row.id, cx)),
                     on_link: Some(self.link_ui(cx)),
                     tufte: false,
+                    select_code: false,
+                    select_pad_x: 0.0,
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -2846,6 +2848,8 @@ impl Transcript {
                     copy: Some(self.copy_ui_for(&row.id, cx)),
                     on_link: Some(self.link_ui(cx)),
                     tufte: false,
+                    select_code: false,
+                    select_pad_x: 0.0,
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -3550,7 +3554,7 @@ fn user_bubble_text(
     let sel_theme = theme.clone();
     let underlay = canvas(
         |_, _, _| (),
-        move |_, _, window, _| {
+        move |bounds, _, window, _| {
             for span in mentions.iter() {
                 for rect in render::range_rects(&layout, &span.range, 0.0, 2.0) {
                     window.paint_quad(quad(
@@ -3563,7 +3567,9 @@ fn user_bubble_text(
                     ));
                 }
             }
-            render::paint_text_selection(window, &sel_key, &text, &layout, &sel_theme);
+            render::paint_text_selection(
+                window, &sel_key, &text, &layout, &sel_theme, bounds, false,
+            );
         },
     )
     .absolute()

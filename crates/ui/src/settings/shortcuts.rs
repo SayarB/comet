@@ -128,6 +128,7 @@ fn description(id: ShortcutId) -> &'static str {
         ShortcutId::ToggleChanges => "Show or hide changes for the current session.",
         ShortcutId::ToggleTerminal => "Show or hide the terminal for the current session.",
         ShortcutId::NewSession => "Open a blank session canvas to start a new session.",
+        ShortcutId::OpenFile => "Search files in the current session and open one in the viewer.",
     }
 }
 

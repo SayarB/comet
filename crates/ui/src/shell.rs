@@ -28,6 +28,7 @@ use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
+use crate::file_open::{FileOpenEvent, FileOpenPalette};
 use crate::file_viewer::{FileViewer, FileViewerEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
@@ -58,6 +59,28 @@ mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
+#[derive(Clone, Copy)]
+enum EditorTarget {
+    Cursor,
+    Zed,
+}
+
+impl EditorTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cursor => "Cursor",
+            Self::Zed => "Zed",
+        }
+    }
+
+    fn command(self) -> &'static str {
+        match self {
+            Self::Cursor => "cursor",
+            Self::Zed => "zed",
+        }
+    }
+}
+
 actions!(
     shell,
     [
@@ -65,7 +88,8 @@ actions!(
         ToggleChanges,
         AddSpacePalette,
         CreateSpacePalette,
-        NewSession
+        NewSession,
+        OpenFilePalette
     ]
 );
 
@@ -149,6 +173,11 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         KeyBinding::new(
             &valid_or_default(&keymap.new_session, "mod-n"),
             NewSession,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.open_file, "mod-p"),
+            OpenFilePalette,
             None,
         ),
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
@@ -758,6 +787,8 @@ pub struct Shell {
     /// overlays the message area only — the composer stays visible, focused,
     /// and usable underneath it.
     file_viewer: Entity<FileViewer>,
+    file_open: Option<Entity<FileOpenPalette>>,
+    file_open_sub: Option<Subscription>,
     /// External file drag hovering the conversation column — shows the
     /// "Drop images to attach" veil over the whole chat area; a drop stages
     /// the files in the composer.
@@ -839,6 +870,8 @@ pub struct Shell {
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, zeron_proto::SessionStatus>,
     user_menu: popover::Popup<()>,
+    /// "Open project in…" menu in the selected session's titlebar.
+    editor_menu: popover::Popup<()>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
@@ -1048,6 +1081,8 @@ impl Shell {
             transcript,
             composer,
             file_viewer,
+            file_open: None,
+            file_open_sub: None,
             file_drag_active: false,
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
@@ -1088,6 +1123,7 @@ impl Shell {
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
+            editor_menu: popover::Popup::default(),
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
@@ -1811,6 +1847,13 @@ impl Shell {
         }
     }
 
+    fn close_editor_menu(&mut self, cx: &mut Context<Self>) {
+        if self.editor_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.editor_menu);
+            cx.notify();
+        }
+    }
+
     /// Close the session-row context menu through the exit animation.
     fn close_chat_menu(&mut self, cx: &mut Context<Self>) {
         if self.chat_menu.begin_close() {
@@ -1862,6 +1905,7 @@ impl Shell {
                 let target = (!chat_id.is_empty()).then_some(chat_id);
                 if self.state.read(cx).selected_chat != target {
                     self.state.update(cx, |s, cx| s.select_chat(target, cx));
+                    self.file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
                 }
             }
             NavEntry::Settings(section) => {
@@ -2066,6 +2110,7 @@ impl Shell {
         self.delete_confirm = None;
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
+            self.file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
         }
         self.composer
             .update(cx, |composer, _| composer.purge_chat(&chat_id));
@@ -4355,6 +4400,9 @@ impl Shell {
         if let Some(overlay) = self.render_add_space_overlay(viewport, window, cx) {
             overlays.push(overlay);
         }
+        if let Some(overlay) = self.render_file_open_overlay(viewport, window, cx) {
+            overlays.push(overlay);
+        }
 
         if let Some(chat_id) = self.delete_confirm.clone() {
             let title = transcript::single_line(
@@ -4707,6 +4755,48 @@ impl Shell {
             .into_any_element()
     }
 
+    fn close_file_open(&mut self, cx: &mut Context<Self>) {
+        self.file_open = None;
+        self.file_open_sub = None;
+        cx.notify();
+    }
+
+    fn toggle_file_open(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_open.is_some() {
+            self.close_file_open(cx);
+            return;
+        }
+        let state = self.state.clone();
+        let palette = cx.new(|cx| FileOpenPalette::new(state, cx));
+        self.file_open_sub = Some(cx.subscribe(&palette, |this, _, event, cx| match event {
+            FileOpenEvent::Dismissed => this.close_file_open(cx),
+            FileOpenEvent::Open(path) => {
+                let path = path.clone();
+                this.close_file_open(cx);
+                if !matches!(this.route, Route::Chat) {
+                    this.close_settings(cx);
+                }
+                this.file_viewer
+                    .update(cx, |viewer, cx| viewer.open(path, cx));
+                cx.notify();
+            }
+        }));
+        self.file_open = Some(palette);
+        cx.notify();
+    }
+
+    fn render_file_open_overlay(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let palette = self.file_open.clone()?;
+        Some(palette.update(cx, |palette, cx| {
+            palette.render_overlay(viewport, window, cx)
+        }))
+    }
+
     /// The file viewer as an absolute layer over the transcript: it starts
     /// below the titlebar (its path header and close control must stay clear
     /// of the window chrome) and runs to the underlay's bottom edge, so the
@@ -4740,6 +4830,9 @@ impl Shell {
     /// listener never steals a dismissal that belonged to the composer.
     fn on_conversation_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
         if event.keystroke.key != "escape" || !self.file_viewer.read(cx).is_open() {
+            return;
+        }
+        if self.file_open.is_some() {
             return;
         }
         self.file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
@@ -6203,7 +6296,7 @@ fn header_icon_button(
     icon_path: &'static str,
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     let muted = theme.text_muted;
     let fade_key = format!("header-icon-{id}");
     div()
@@ -6341,6 +6434,9 @@ impl Render for Shell {
                 } else {
                     this.open_add_space_palette(spaces::AddSpaceMode::Create, cx);
                 }
+            }))
+            .on_action(cx.listener(|this, _: &OpenFilePalette, window, cx| {
+                this.toggle_file_open(window, cx);
             }));
 
         let render_gate = if restart_required {
