@@ -121,12 +121,13 @@ struct SpaceView: View {
 
 /// The desktop add-space palette translated to a sheet: device tabs, mono
 /// breadcrumb with an up button, the device's folders (git repos badged),
-/// "Use this folder" pinned at the bottom. Listing comes from the device over
-/// the relay (ListFolders); dotfiles are pre-filtered and long listings are
-/// truncated at 500 by the engine.
+/// "Use this folder" pinned at the bottom. Pass `creates` to name a new
+/// folder at the current listing instead. Listing comes from the device over
+/// the relay (ListFolders); mkdir is CreateFolder; then Mutate createSpace.
 struct NewSpaceSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    var creates = false
     let onCreated: (String) -> Void
 
     @State private var deviceId: String?
@@ -134,6 +135,7 @@ struct NewSpaceSheet: View {
     @State private var loading = false
     @State private var error: String?
     @State private var creating = false
+    @State private var projectName = ""
 
     private var devices: [DeviceRow] {
         // Engines own folders; this phone can't. Offer every other device.
@@ -158,12 +160,17 @@ struct NewSpaceSheet: View {
                     breadcrumbBar
                         .padding(.horizontal, 20)
                         .padding(.bottom, 10)
+                    if creates {
+                        nameField
+                            .padding(.horizontal, 20)
+                            .padding(.bottom, 10)
+                    }
                     folderList
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .background(SheetStyle.panel)
-            .navigationTitle("New space")
+            .navigationTitle(creates ? "Create project" : "New space")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -334,13 +341,33 @@ struct NewSpaceSheet: View {
         .buttonStyle(SheetRowButtonStyle())
     }
 
+    private var trimmedName: String {
+        projectName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var nameField: some View {
+        TextField("Name the project…", text: $projectName)
+            .font(Theme.sans(15))
+            .foregroundStyle(Theme.text)
+            .padding(.horizontal, 16)
+            .frame(height: 44)
+            .background(SheetStyle.cardFill, in: RoundedRectangle(cornerRadius: SheetStyle.cardRadius))
+            .overlay(RoundedRectangle(cornerRadius: SheetStyle.cardRadius)
+                .strokeBorder(whiteAlpha(0.06), lineWidth: 1))
+    }
+
     private var useFolderButton: some View {
-        let name = (listing?.path as NSString?)?.lastPathComponent ?? ""
-        return SheetPrimaryButton(
-            title: creating ? "Creating…" : (name.isEmpty ? "Use this folder" : "Use “\(name)”"),
-            enabled: listing != nil && !creating && !loading
-        ) {
-            create()
+        let listingName = (listing?.path as NSString?)?.lastPathComponent ?? ""
+        let title: String = {
+            if creating { return "Creating…" }
+            if creates {
+                return trimmedName.isEmpty ? "Create project" : "Create “\(trimmedName)”"
+            }
+            return listingName.isEmpty ? "Use this folder" : "Use “\(listingName)”"
+        }()
+        let enabled = listing != nil && !creating && !loading && (!creates || !trimmedName.isEmpty)
+        return SheetPrimaryButton(title: title, enabled: enabled) {
+            if creates { createNamed() } else { create() }
         }
     }
 
@@ -391,6 +418,37 @@ struct NewSpaceSheet: View {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 dismiss()
                 onCreated(id)
+            }
+        }
+    }
+
+    private func createNamed() {
+        guard let selectedDeviceId, let listing else { return }
+        let name = trimmedName
+        guard !name.isEmpty, name != ".", name != "..",
+              !name.contains("/"), !name.contains("\\") else {
+            error = "Invalid folder name"
+            return
+        }
+        let parent = listing.path
+        let path = parent.hasSuffix("/") ? parent + name : "\(parent)/\(name)"
+        creating = true
+        error = nil
+        Task {
+            guard let created = await model.createFolder(deviceId: selectedDeviceId, path: path) else {
+                creating = false
+                error = "Couldn't create that folder. It may already exist."
+                return
+            }
+            let id = await model.createSpace(deviceId: selectedDeviceId,
+                                             path: created, gitDetected: false)
+            creating = false
+            if let id {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                dismiss()
+                onCreated(id)
+            } else {
+                error = "Created the folder, but couldn't add the project."
             }
         }
     }

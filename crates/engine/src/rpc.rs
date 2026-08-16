@@ -20,7 +20,7 @@
 //!   `SelectOrg {organizationId}`
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
-//!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
+//!   `ListFolders {path?}`, `CreateFolder {path}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
 //!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
 //! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
@@ -148,6 +148,12 @@ struct SetWorktreeRootParams {
 struct ListFoldersParams {
     #[serde(default)]
     path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateFolderParams {
+    path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1083,6 +1089,7 @@ fn forwardable(method: &str) -> bool {
             | methods::FETCH_ALL
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
+            | methods::CREATE_FOLDER
             | methods::SEARCH_FILES
             | methods::READ_WORKSPACE_FILE
             | methods::CREATE_WORKTREE
@@ -1820,6 +1827,14 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)
             }
+            methods::CREATE_FOLDER => {
+                let p: CreateFolderParams = parse_params(params)?;
+                let path = self
+                    .repos
+                    .create_folder(&p.path)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "path": path }))
+            }
             methods::SEARCH_FILES => {
                 let p: FileSearchParams = parse_params(params)?;
                 if p.query.chars().count() > 256 {
@@ -2075,6 +2090,7 @@ mod tests {
         // own filesystem — so the method has to honor `targetDeviceId`.
         assert!(forwardable(methods::READ_WORKSPACE_FILE));
         assert!(forwardable(methods::FETCH_ALL));
+        assert!(forwardable(methods::CREATE_FOLDER));
     }
 
     /// Every expected preview outcome, driven off one temporary checkout.

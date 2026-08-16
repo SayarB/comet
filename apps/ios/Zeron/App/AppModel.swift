@@ -435,6 +435,17 @@ final class AppModel {
         return await workspace?.listFolders(deviceId: deviceId, path: path)
     }
 
+    /// Create one directory on the device, then the caller registers it as a space.
+    func createFolder(deviceId: String, path: String) async -> String? {
+        if let demo {
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            let parent = (path as NSString).deletingLastPathComponent
+            let name = (path as NSString).lastPathComponent
+            return demo.createFolder(parent: parent, name: name)
+        }
+        return try? await workspace?.createFolder(deviceId: deviceId, path: path)
+    }
+
     @discardableResult
     func createSpace(deviceId: String, path: String, gitDetected: Bool = false) async -> String? {
         if let demo {

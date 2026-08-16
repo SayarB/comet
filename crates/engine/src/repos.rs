@@ -1042,6 +1042,48 @@ impl Repos {
             )),
         }
     }
+
+    /// Create one directory at `path` (`mkdir`, not `mkdir -p`). The parent
+    /// must already exist. Names are a single segment: empty, `.`, `..`,
+    /// separators, and NUL are rejected; an existing path is not reused.
+    pub fn create_folder(&self, path: &str) -> Result<String, EngineError> {
+        let target = absolutize(Path::new(path.trim()));
+        if target
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(EngineError::Other("Invalid folder name".into()));
+        }
+        let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        validate_folder_name(name)?;
+        let parent = target
+            .parent()
+            .ok_or_else(|| EngineError::Other("Invalid folder path".into()))?;
+        if !parent.is_dir() {
+            return Err(EngineError::Other(format!(
+                "No such folder: {}",
+                parent.display()
+            )));
+        }
+        match std::fs::create_dir(&target) {
+            Ok(()) => Ok(target.to_string_lossy().into_owned()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(EngineError::Other(
+                format!("Already exists: {}", target.display()),
+            )),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
+/// Single path segment allowed as a new project folder name.
+fn validate_folder_name(name: &str) -> Result<(), EngineError> {
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(EngineError::Other("Invalid folder name".into()));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(EngineError::Other("Invalid folder name".into()));
+    }
+    Ok(())
 }
 
 fn resolve_worktrees_root(

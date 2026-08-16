@@ -96,6 +96,8 @@ pub mod methods {
     pub const FETCH_ALL: &str = "FetchAll";
     pub const SWITCH_REF: &str = "SwitchRef";
     pub const LIST_FOLDERS: &str = "ListFolders";
+    /// Create one directory (`mkdir`, not `mkdir -p`) on the target device.
+    pub const CREATE_FOLDER: &str = "CreateFolder";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     pub const SEARCH_FILES: &str = "SearchFiles";
     /// Bounded read-only text preview of one file inside a chat's checkout —
