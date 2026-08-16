@@ -14,6 +14,7 @@ use gpui::{
 };
 
 use crate::appearance::{self, AppearanceMode};
+use crate::icons;
 use crate::settings::widgets;
 use crate::theme::{Appearance, Theme};
 
@@ -212,6 +213,60 @@ impl Render for AppearancePage {
                             .text_color(theme.text_muted)
                             .line_height(px(18.0))
                             .child(helper(current, system)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(32.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.0))
+                            .child(widgets::field_label(&theme, "Markdown"))
+                            .child(
+                                widgets::section_card(&theme).mt(px(0.0)).child(
+                                    widgets::card_row(&theme, true)
+                                        .child(widgets::row_tile(&theme, icons::DOCUMENT))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .flex()
+                                                .flex_col()
+                                                .child(widgets::row_title(
+                                                    &theme,
+                                                    "Editorial serif",
+                                                ))
+                                                .child(widgets::meta_line(
+                                                    &theme,
+                                                    vec![div()
+                                                        .child(SharedString::from(
+                                                            "Use a reading serif for replies and \
+                                                             the file viewer — the same register \
+                                                             Cursor and other agent UIs use. \
+                                                             Chrome, the composer, and code \
+                                                             stay on Geist.",
+                                                        ))
+                                                        .into_any_element()],
+                                                )),
+                                        )
+                                        .child(
+                                            widgets::toggle_switch(
+                                                &theme,
+                                                appearance::markdown_serif(cx),
+                                            )
+                                            .id("appearance-markdown-serif")
+                                            .cursor_pointer()
+                                            .on_click(
+                                                cx.listener(|_, _, _, cx| {
+                                                    appearance::set_markdown_serif(
+                                                        !appearance::markdown_serif(cx),
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        ),
+                                ),
+                            ),
                     ),
             )
     }

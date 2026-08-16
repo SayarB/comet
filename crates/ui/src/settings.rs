@@ -94,6 +94,9 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Paint markdown body (replies, file viewer) in the editorial serif
+    /// rather than Geist. Off by default; UI chrome and code stay sans/mono.
+    pub markdown_serif: bool,
 }
 
 impl Default for UiSettings {
@@ -116,6 +119,7 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            markdown_serif: false,
         }
     }
 }
@@ -387,6 +391,7 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            markdown_serif: true,
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
@@ -405,6 +410,10 @@ mod tests {
         .unwrap();
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
+        assert!(
+            !loaded.markdown_serif,
+            "pre-serif files default to Geist markdown"
+        );
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
         assert!(

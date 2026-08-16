@@ -97,6 +97,13 @@ pub fn theme_generation() -> u32 {
     THEME_GENERATION.load(Ordering::Relaxed)
 }
 
+/// Force markdown flatten caches to drop. Palette install already bumps when
+/// light/dark moves; a font-family toggle does not, so the markdown renderer
+/// would otherwise keep Geist-shaped runs.
+pub fn bump_theme_generation() {
+    THEME_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 /// [`CURRENT_APPEARANCE`] is process-wide, so under the parallel test runner
 /// any test that flips it — or asserts on the output of a helper that reads it
 /// ([`ink`], [`hairline`], [`wash`], …) — must hold this lock. Crate-visible
@@ -417,9 +424,16 @@ pub struct Theme {
     pub font_sans: SharedString,
     /// Monospace family for code/terminal.
     pub font_mono: SharedString,
+    /// Editorial serif for markdown body when the reading-font toggle is on.
+    /// Cursor, Claude, and similar agent UIs use this register: Iowan Old
+    /// Style on macOS, Georgia on Windows, Liberation Serif on Linux.
+    pub font_serif: SharedString,
     /// Explicit system fallbacks, for callers that want to skip the lookup.
     pub font_sans_fallback: SharedString,
     pub font_mono_fallback: SharedString,
+    /// When true, markdown body (replies + the file viewer) paints in
+    /// [`Self::font_serif`]. UI chrome, the composer, and code stay sans/mono.
+    pub markdown_serif: bool,
 }
 
 impl Theme {
@@ -640,8 +654,10 @@ impl Theme {
             diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
+            font_serif: system_serif().into(),
             font_sans_fallback: system_sans().into(),
             font_mono_fallback: system_mono().into(),
+            markdown_serif: false,
         }
     }
 
@@ -716,8 +732,10 @@ impl Theme {
             diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
+            font_serif: system_serif().into(),
             font_sans_fallback: system_sans().into(),
             font_mono_fallback: system_mono().into(),
+            markdown_serif: false,
         }
     }
 
@@ -732,9 +750,26 @@ impl Theme {
     /// Install the theme for `appearance` as the gpui global and point the
     /// context-free paint helpers at it. The **only** way the appearance should
     /// change — setting the global directly leaves [`current_appearance`] stale.
+    /// The markdown serif toggle rides the existing global so a palette swap
+    /// does not silently revert it to Geist.
     pub fn install(appearance: Appearance, cx: &mut App) {
+        let markdown_serif = cx
+            .try_global::<Theme>()
+            .map(|t| t.markdown_serif)
+            .unwrap_or(false);
         set_current_appearance(appearance);
-        cx.set_global(Self::for_appearance(appearance));
+        let mut theme = Self::for_appearance(appearance);
+        theme.markdown_serif = markdown_serif;
+        cx.set_global(theme);
+    }
+
+    /// Family used for markdown body / headings (not code).
+    pub fn md_body_font(&self) -> SharedString {
+        if self.markdown_serif {
+            self.font_serif.clone()
+        } else {
+            self.font_sans.clone()
+        }
     }
 
     /// Read the theme global.
@@ -773,6 +808,18 @@ fn system_sans() -> &'static str {
         "Segoe UI"
     } else {
         "DejaVu Sans"
+    }
+}
+
+/// The editorial serif Cursor and similar agent UIs pick for reading markdown:
+/// Iowan Old Style on Apple, Georgia on Windows, Liberation Serif elsewhere.
+fn system_serif() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Iowan Old Style"
+    } else if cfg!(target_os = "windows") {
+        "Georgia"
+    } else {
+        "Liberation Serif"
     }
 }
 
@@ -1681,5 +1728,14 @@ mod tests {
         assert_eq!(Theme::HEADER_HEIGHT, 44.0); // h-11
         assert_eq!(Theme::STATUS_STRIP_HEIGHT, 24.0); // h-6
         assert_eq!(Theme::BUBBLE_RADIUS, 16.0);
+    }
+
+    #[test]
+    fn markdown_body_font_follows_the_serif_toggle() {
+        let mut theme = Theme::dark();
+        assert_eq!(theme.md_body_font().as_ref(), "Geist");
+        theme.markdown_serif = true;
+        assert_eq!(theme.md_body_font().as_ref(), system_serif());
+        assert_ne!(theme.font_serif.as_ref(), theme.font_sans.as_ref());
     }
 }

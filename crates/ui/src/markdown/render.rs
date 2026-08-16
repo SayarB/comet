@@ -551,7 +551,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         let mut f = if run.style.code {
             font(theme.font_mono.clone())
         } else {
-            font(theme.font_sans.clone())
+            font(theme.md_body_font())
         };
         f.weight = if run.style.bold && base_weight.0 < FontWeight::SEMIBOLD.0 {
             FontWeight::SEMIBOLD
