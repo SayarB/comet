@@ -27,6 +27,10 @@ use crate::markdown::parser::{BlockTree, parse_full};
 use crate::markdown::render::{self, RenderOptions};
 use crate::state::AppState;
 use crate::theme::Theme;
+use crate::transcript::MAX_CONTENT_WIDTH;
+
+/// Horizontal gutter matching the transcript (`px-4 @3xl:px-12` → 48px).
+const CHAT_GUTTER: f32 = 48.0;
 
 // ---------------------------------------------------------------------------
 // Link classification (shared by the transcript and the viewer itself)
@@ -401,7 +405,7 @@ impl FileViewer {
             .flex_none()
             .h(px(36.0))
             .w_full()
-            .px(px(48.0))
+            .px(px(12.0))
             .flex()
             .flex_row()
             .items_center()
@@ -503,7 +507,7 @@ impl FileViewer {
                         .size_full()
                         .overflow_y_scroll()
                         .track_scroll(&self.scroll)
-                        .px(px(48.0))
+                        .px(px(4.0))
                         .pt(px(16.0))
                         .pb(px(16.0 + inset))
                         .child(render::render_tree(tree, &opts, &theme, window, &|_| None)),
@@ -520,7 +524,7 @@ impl FileViewer {
                     .size_full()
                     .overflow_scroll()
                     .track_scroll(&self.scroll)
-                    .px(px(48.0))
+                    .px(px(4.0))
                     .pt(px(16.0))
                     .pb(px(16.0 + inset))
                     .font_family(theme.font_mono.clone())
@@ -580,17 +584,26 @@ impl Render for FileViewer {
         div()
             .size_full()
             .flex()
-            .flex_col()
-            // Opaque: the transcript underneath must not ghost through the
-            // file's text.
+            .justify_center()
+            // Same recipe as a transcript row: 48px gutters around a 46rem
+            // column, so a markdown file lines up with the chat it covers.
+            .px(px(CHAT_GUTTER))
             .bg(theme.bg)
             .border_t_1()
             .border_color(theme.border)
-            // Swallow clicks and scrolls so they never reach the transcript.
             .id("file-viewer")
             .occlude()
-            .child(header)
-            .child(div().flex_1().min_h_0().child(body))
+            .child(
+                div()
+                    .h_full()
+                    .w_full()
+                    .max_w(px(MAX_CONTENT_WIDTH))
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .child(div().flex_1().min_h_0().child(body)),
+            )
             .into_any_element()
     }
 }
