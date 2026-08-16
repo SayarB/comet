@@ -4636,10 +4636,18 @@ impl Shell {
                             .band_top(Theme::TRANSCRIPT_FADE_BAND)
                             .band_bottom(bottom_band),
                         )
-                        .children(self.render_jump_to_bottom(stack_h, cx))
+                        // The pill scrolls the transcript, which a previewed
+                        // file completely covers — leaving it on top of the
+                        // viewer offers a control for content nobody can see.
+                        .children(
+                            (!self.file_viewer.read(cx).is_open())
+                                .then(|| self.render_jump_to_bottom(stack_h, cx))
+                                .flatten(),
+                        )
                         // Painted last inside the transcript underlay: the
-                        // viewer covers the message area (and its jump pill)
-                        // while the chrome stack below stays untouched.
+                        // viewer spans the underlay's full height and slides
+                        // under the glass chrome stack, exactly as the
+                        // transcript it replaces does.
                         .children(self.render_file_viewer(stack_h, cx))
                 },
             )
@@ -4686,24 +4694,27 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The file viewer as an absolute layer over the transcript only: it
-    /// starts below the titlebar and stops at the measured chrome stack, so
-    /// the composer and its send/steer/stop controls stay visible and
-    /// clickable while a file is open. `stack_h` is the same measurement the
-    /// transcript's bottom fade and jump pill ride.
+    /// The file viewer as an absolute layer over the transcript: it starts
+    /// below the titlebar (its path header and close control must stay clear
+    /// of the window chrome) and runs to the underlay's bottom edge, so the
+    /// file passes BEHIND the glass composer the same way the transcript does
+    /// instead of stopping short of it in a letterboxed panel (user report).
+    /// The composer keeps painting over it — later sibling in the column — so
+    /// send/steer/stop stay visible and clickable. `stack_h` is the same
+    /// chrome measurement the transcript's bottom fade rides; the viewer uses
+    /// it to keep its own content out from under that chrome at rest.
     fn render_file_viewer(&mut self, stack_h: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !matches!(self.route, Route::Chat) || !self.file_viewer.read(cx).is_open() {
             return None;
         }
+        self.file_viewer.read(cx).set_chrome_inset(stack_h);
         Some(
             div()
                 .absolute()
                 .top(px(Theme::TITLEBAR_HEIGHT))
                 .left_0()
                 .right_0()
-                // Sit above the measured chrome stack (status strip + composer)
-                // so send/steer/stop stay visible and usable.
-                .bottom(px(stack_h.max(0.0)))
+                .bottom_0()
                 .child(self.file_viewer.clone())
                 .into_any_element(),
         )

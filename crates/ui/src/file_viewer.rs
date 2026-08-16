@@ -12,7 +12,7 @@
 //! (missing, outside the checkout, directory, binary, oversized) gets its own
 //! deliberate state rather than a blank pane.
 
-use std::{rc::Rc, sync::Arc};
+use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, ScrollHandle, SharedString, Task, Window, div,
@@ -272,6 +272,11 @@ pub struct FileViewer {
     next_request: u64,
     scroll: ScrollHandle,
     task: Option<Task<()>>,
+    /// Height of the glass chrome (status strip + composer) the viewer's own
+    /// bottom edge runs behind, written by the shell each frame. The file's
+    /// content is padded and faded across it, so a line is never parked
+    /// unreadably under the composer while still scrolling past it.
+    chrome_inset: Cell<f32>,
 }
 
 impl EventEmitter<FileViewerEvent> for FileViewer {}
@@ -284,11 +289,19 @@ impl FileViewer {
             next_request: 0,
             scroll: ScrollHandle::new(),
             task: None,
+            chrome_inset: Cell::new(0.0),
         }
     }
 
     pub fn is_open(&self) -> bool {
         self.open.is_some()
+    }
+
+    /// Report the chrome height this frame (see [`Self::chrome_inset`]). Takes
+    /// `&self` so the shell can set it while laying the overlay out, without a
+    /// notify that would only schedule the frame it is already building.
+    pub fn set_chrome_inset(&self, height: f32) {
+        self.chrome_inset.set(height.max(0.0));
     }
 
     /// Open (or replace) the previewed file. The request targets the selected
@@ -430,6 +443,19 @@ impl FileViewer {
             .into_any_element()
     }
 
+    /// Ramp the file's text out across the glass chrome it scrolls behind.
+    /// A painted overlay cannot do this job: the composer is translucent, so
+    /// "what is behind the window" has no paintable color — the fade has to be
+    /// per-glyph, the same primitive the transcript rides. Gated on the scroll
+    /// handle so a file resting at its end (its trailing pad already filling
+    /// the band) shows no ramp at all.
+    fn fade_under_chrome(&self, content: impl IntoElement, inset: f32) -> AnyElement {
+        crate::edge_fade::edge_faded(Theme::TRANSCRIPT_FADE_BAND, false, true, content)
+            .band_bottom((inset - Theme::STATUS_STRIP_HEIGHT).max(1.0))
+            .fade_overflow_y(&self.scroll)
+            .into_any_element()
+    }
+
     fn render_body(
         &mut self,
         body: &ViewerBody,
@@ -438,6 +464,10 @@ impl FileViewer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
+        // Everything below the file's text lives behind the glass chrome, so
+        // padding keeps the end of the file scrollable into view and the
+        // centered states stay centered in the part the user can actually see.
+        let inset = self.chrome_inset.get();
         match body {
             ViewerBody::Loading => {
                 let view = cx.entity_id();
@@ -446,6 +476,7 @@ impl FileViewer {
                     .flex()
                     .items_center()
                     .justify_center()
+                    .pb(px(inset))
                     .child(crate::loaders::gradient_spinner(
                         "file-viewer-loading",
                         &theme,
@@ -466,34 +497,40 @@ impl FileViewer {
                     })),
                     ..RenderOptions::settled(format!("file-viewer-{request}").into())
                 };
-                div()
-                    .id("file-viewer-markdown")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .px(px(20.0))
-                    .py(px(16.0))
-                    .child(render::render_tree(tree, &opts, &theme, window, &|_| None))
-                    .into_any_element()
+                self.fade_under_chrome(
+                    div()
+                        .id("file-viewer-markdown")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .px(px(20.0))
+                        .pt(px(16.0))
+                        .pb(px(16.0 + inset))
+                        .child(render::render_tree(tree, &opts, &theme, window, &|_| None)),
+                    inset,
+                )
             }
             // One shaped text element preserves newlines while bounding GPUI
             // element count independently of line count. A 512 KiB file made
             // from one-character lines therefore remains one content element,
             // not hundreds of thousands.
-            ViewerBody::Text(text) => div()
-                .id("file-viewer-text")
-                .size_full()
-                .overflow_scroll()
-                .track_scroll(&self.scroll)
-                .px(px(20.0))
-                .py(px(16.0))
-                .font_family(theme.font_mono.clone())
-                .text_size(px(render::CODE_TEXT_SIZE))
-                .line_height(px(render::CODE_LINE_HEIGHT))
-                .text_color(theme.text)
-                .whitespace_nowrap()
-                .child(text.clone())
-                .into_any_element(),
+            ViewerBody::Text(text) => self.fade_under_chrome(
+                div()
+                    .id("file-viewer-text")
+                    .size_full()
+                    .overflow_scroll()
+                    .track_scroll(&self.scroll)
+                    .px(px(20.0))
+                    .pt(px(16.0))
+                    .pb(px(16.0 + inset))
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(render::CODE_TEXT_SIZE))
+                    .line_height(px(render::CODE_LINE_HEIGHT))
+                    .text_color(theme.text)
+                    .whitespace_nowrap()
+                    .child(text.clone()),
+                inset,
+            ),
             ViewerBody::Notice { title, detail } => div()
                 .size_full()
                 .flex()
@@ -502,6 +539,7 @@ impl FileViewer {
                 .justify_center()
                 .gap(px(6.0))
                 .px(px(32.0))
+                .pb(px(inset))
                 .child(
                     icon(icons::INFO_CIRCLE)
                         .size(px(20.0))
