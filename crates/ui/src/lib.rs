@@ -18,6 +18,7 @@ pub mod attachments;
 pub mod changes;
 pub mod composer;
 pub mod edge_fade;
+pub mod file_open;
 pub mod file_viewer;
 pub mod frost;
 pub mod history;
