@@ -370,6 +370,54 @@ pub struct CheckoutFileDiffText {
     pub stale: bool,
 }
 
+/// Largest file the read-only viewer will fetch. Bigger files are refused
+/// outright rather than truncated: a half-rendered markdown artifact reads as
+/// a complete one.
+pub const WORKSPACE_FILE_PREVIEW_LIMIT: u64 = 512 * 1024;
+
+/// `ReadWorkspaceFile` params — the chat whose checkout roots the lookup plus
+/// the clicked link target (workspace-relative, or absolute inside the root).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadWorkspaceFileRequest {
+    pub chat_id: String,
+    pub path: String,
+}
+
+/// `ReadWorkspaceFile` reply. Expected preview failures are typed states, not
+/// error strings: the viewer renders each one deliberately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFileRead {
+    /// Checkout-relative path that was resolved, echoing the request when it
+    /// never resolved to one.
+    pub path: String,
+    #[serde(flatten)]
+    pub content: WorkspaceFileContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum WorkspaceFileContent {
+    /// UTF-8 text at or under [`WORKSPACE_FILE_PREVIEW_LIMIT`] — never partial.
+    Text {
+        text: String,
+    },
+    NotFound,
+    /// The target canonicalizes outside the chat's checkout (`..`, a symlink
+    /// escape, or an absolute path elsewhere on the host).
+    OutsideWorkspace,
+    Directory,
+    /// Not UTF-8 text, or not a regular file.
+    NotPreviewable,
+    #[serde(rename_all = "camelCase")]
+    TooLarge {
+        byte_len: u64,
+        limit: u64,
+    },
+    PermissionDenied,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserProfile {
@@ -534,6 +582,77 @@ mod tests {
         assert_eq!(value["commitSha"], "deadbeef");
         assert_eq!(
             serde_json::from_value::<GetCheckoutFileDiffTextRequest>(value).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn workspace_file_read_round_trips_every_state() {
+        let reads = [
+            WorkspaceFileRead {
+                path: "docs/plan.md".into(),
+                content: WorkspaceFileContent::Text {
+                    text: "# Plan\n".into(),
+                },
+            },
+            WorkspaceFileRead {
+                path: "missing.md".into(),
+                content: WorkspaceFileContent::NotFound,
+            },
+            WorkspaceFileRead {
+                path: "../outside.md".into(),
+                content: WorkspaceFileContent::OutsideWorkspace,
+            },
+            WorkspaceFileRead {
+                path: "src".into(),
+                content: WorkspaceFileContent::Directory,
+            },
+            WorkspaceFileRead {
+                path: "logo.png".into(),
+                content: WorkspaceFileContent::NotPreviewable,
+            },
+            WorkspaceFileRead {
+                path: "huge.md".into(),
+                content: WorkspaceFileContent::TooLarge {
+                    byte_len: WORKSPACE_FILE_PREVIEW_LIMIT + 1,
+                    limit: WORKSPACE_FILE_PREVIEW_LIMIT,
+                },
+            },
+            WorkspaceFileRead {
+                path: "secret".into(),
+                content: WorkspaceFileContent::PermissionDenied,
+            },
+        ];
+        for read in reads {
+            let value = serde_json::to_value(&read).unwrap();
+            assert!(value["state"].is_string(), "state tag is flattened in");
+            assert_eq!(
+                serde_json::from_value::<WorkspaceFileRead>(value).unwrap(),
+                read
+            );
+        }
+
+        // The wire shape the UI decodes: camelCase tag + camelCase fields.
+        let value = serde_json::to_value(WorkspaceFileRead {
+            path: "huge.md".into(),
+            content: WorkspaceFileContent::TooLarge {
+                byte_len: 900_000,
+                limit: WORKSPACE_FILE_PREVIEW_LIMIT,
+            },
+        })
+        .unwrap();
+        assert_eq!(value["state"], "tooLarge");
+        assert_eq!(value["byteLen"], 900_000);
+        assert_eq!(value["limit"], WORKSPACE_FILE_PREVIEW_LIMIT);
+
+        let request = ReadWorkspaceFileRequest {
+            chat_id: "chat".into(),
+            path: "docs/plan.md".into(),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["chatId"], "chat");
+        assert_eq!(
+            serde_json::from_value::<ReadWorkspaceFileRequest>(value).unwrap(),
             request
         );
     }
