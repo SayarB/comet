@@ -216,6 +216,7 @@ pub fn render_block(
             MD_TEXT_SIZE,
             MD_LINE_HEIGHT,
             false,
+            false,
             top_ix,
             ix,
             opts,
@@ -223,7 +224,7 @@ pub fn render_block(
         ),
         Block::Heading { level, runs } => {
             let (size, line) = heading_metrics(*level);
-            text_element(runs, size, line, true, top_ix, ix, opts, theme)
+            text_element(runs, size, line, true, true, top_ix, ix, opts, theme)
         }
         Block::CodeBlock { language, code } => render_code_block(
             language.as_deref(),
@@ -990,6 +991,7 @@ fn text_element(
     size: f32,
     line_height: f32,
     bold_default: bool,
+    centered: bool,
     top_ix: usize,
     ix: usize,
     opts: &RenderOptions,
@@ -1003,8 +1005,10 @@ fn text_element(
     let flat = flatten_cached(runs, weight, top_ix, ix, opts, theme);
     let inner = flat_text_element(&flat, ix, opts, theme);
     div()
+        .w_full()
         .text_size(px(size))
         .line_height(px(line_height))
+        .when(centered, |el| el.text_center())
         .child(inner)
         .into_any_element()
 }

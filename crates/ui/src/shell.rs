@@ -4715,6 +4715,7 @@ impl Shell {
             return None;
         }
         self.file_viewer.read(cx).set_chrome_inset(stack_h);
+        let theme = Theme::of(cx);
         Some(
             div()
                 .absolute()
@@ -4722,7 +4723,20 @@ impl Shell {
                 .left_0()
                 .right_0()
                 .bottom_0()
-                .child(self.file_viewer.clone())
+                // Cover the transcript, then sit the viewer on the same
+                // 46rem column the chat uses so a wide pane doesn't stretch
+                // a markdown page across the whole window (user report).
+                .bg(theme.bg)
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .h_full()
+                        .w_full()
+                        .max_w(px(transcript::MAX_CONTENT_WIDTH))
+                        .min_w_0()
+                        .child(self.file_viewer.clone()),
+                )
                 .into_any_element(),
         )
     }

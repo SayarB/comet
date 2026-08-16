@@ -27,7 +27,6 @@ use crate::markdown::parser::{BlockTree, parse_full};
 use crate::markdown::render::{self, RenderOptions};
 use crate::state::AppState;
 use crate::theme::Theme;
-use crate::transcript::MAX_CONTENT_WIDTH;
 
 // ---------------------------------------------------------------------------
 // Link classification (shared by the transcript and the viewer itself)
@@ -504,22 +503,10 @@ impl FileViewer {
                         .size_full()
                         .overflow_y_scroll()
                         .track_scroll(&self.scroll)
-                        // Same reading column as the transcript: 46rem body,
-                        // centered, left-aligned type. Full-bleed serif looks
-                        // like a coding tool; this is the editorial measure
-                        // Cursor-like UIs use with Iowan/Georgia.
-                        .flex()
-                        .justify_center()
-                        .px(px(48.0))
+                        .px(px(8.0))
                         .pt(px(16.0))
                         .pb(px(16.0 + inset))
-                        .child(
-                            div()
-                                .w_full()
-                                .max_w(px(MAX_CONTENT_WIDTH))
-                                .min_w_0()
-                                .child(render::render_tree(tree, &opts, &theme, window, &|_| None)),
-                        ),
+                        .child(render::render_tree(tree, &opts, &theme, window, &|_| None)),
                     inset,
                 )
             }
