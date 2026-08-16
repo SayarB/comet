@@ -1827,9 +1827,9 @@ impl Pickers {
     }
 
     /// The project popover: search + one row per project on the picked device
-    /// (check on the current pick), then a "New project…" action row. Rows
-    /// are device-scoped, so no per-row `@ device` tag — the device chip next
-    /// door names the host.
+    /// (check on the current pick), then "New project…" and "Create project…".
+    /// Rows are device-scoped, so no per-row `@ device` tag — the device chip
+    /// next door names the host.
     fn render_space_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let rows = self.filtered_space_rows(cx);
@@ -1899,6 +1899,26 @@ impl Pickers {
                     .truncate()
                     .child(SharedString::from("New project…")),
             );
+        let create_project =
+            popover::menu_row_nav(&theme, false, false, "project-create".to_string())
+                .id("project-create")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.close(cx);
+                    window.dispatch_action(Box::new(crate::shell::CreateSpacePalette), cx);
+                }))
+                .child(
+                    crate::icons::icon(crate::icons::PLUS)
+                        .size(px(12.0))
+                        .flex_none()
+                        .text_color(theme.text_muted.opacity(0.7)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(SharedString::from("Create project…")),
+                );
         div()
             .flex()
             .flex_col()
@@ -1918,6 +1938,7 @@ impl Pickers {
                     .bg(theme.border.opacity(0.6)),
             )
             .child(new_project)
+            .child(create_project)
             .into_any_element()
     }
 
@@ -3722,7 +3743,10 @@ mod tests {
             initial_model_rail(false, true, Some("auto-smart"), &["auto-smart".into()]),
             ModelRail::Favorites
         );
-        assert_eq!(initial_model_rail(false, true, Some("auto-smart"), &[]), ModelRail::Harness);
+        assert_eq!(
+            initial_model_rail(false, true, Some("auto-smart"), &[]),
+            ModelRail::Harness
+        );
     }
 
     #[test]

@@ -13,6 +13,13 @@ use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_pa
 use gpui::FocusHandle;
 use zeron_proto::{ChatIndicator, Device, FolderListing, Space};
 
+/// Attach an existing folder, or create a new one at the browsed parent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AddSpaceMode {
+    Attach,
+    Create,
+}
+
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
 /// recipe as the composer's ref picker: filter input on top
 /// (`PaletteSearch` context so ↑↓/⏎ bubble to the card), ranked substring
@@ -34,6 +41,7 @@ pub(super) enum SpacesMenuRow {
     All,
     Space(String),
     AddSpace,
+    CreateSpace,
 }
 
 /// The add-space palette (a command-K surface, summoned by ⌘K): search bar
@@ -61,6 +69,7 @@ pub(super) struct AddSpaceFlow {
     active: usize,
     submit_busy: bool,
     error: Option<SharedString>,
+    mode: AddSpaceMode,
     /// Tracked on the card (`track_focus`) — puts the card on the keyboard
     /// dispatch path so ↑↓/⌫/esc reach `add_space_key` while the search input
     /// holds focus (the structure every working picker uses).
@@ -150,8 +159,9 @@ impl Shell {
     // ---- sidebar sections ----
 
     /// The filter's display rows: "All projects", then spaces matching the
-    /// search (ranked — `popover::filter_indices`), then "New project…".
-    /// "All" only shows on an empty query (searching means hunting a space).
+    /// search (ranked — `popover::filter_indices`), then "New project…" and
+    /// "Create project…". "All" only shows on an empty query (searching means
+    /// hunting a space).
     fn spaces_menu_rows(&self, cx: &App) -> Vec<SpacesMenuRow> {
         let query = self
             .spaces_menu
@@ -174,6 +184,7 @@ impl Shell {
                 .map(|ix| SpacesMenuRow::Space(spaces[ix].id.clone())),
         );
         rows.push(SpacesMenuRow::AddSpace);
+        rows.push(SpacesMenuRow::CreateSpace);
         rows
     }
 
@@ -222,7 +233,11 @@ impl Shell {
             SpacesMenuRow::Space(id) => self.set_space_filter(Some(id), cx),
             SpacesMenuRow::AddSpace => {
                 self.close_spaces_menu(cx);
-                self.open_add_space(cx);
+                self.open_add_space_palette(AddSpaceMode::Attach, cx);
+            }
+            SpacesMenuRow::CreateSpace => {
+                self.close_spaces_menu(cx);
+                self.open_add_space_palette(AddSpaceMode::Create, cx);
             }
         }
     }
@@ -432,7 +447,8 @@ impl Shell {
     }
 
     /// The dropdown card: search on top, "All projects" + space rows (check on
-    /// the active filter; right-click for rename/remove) + "New project…".
+    /// the active filter; right-click for rename/remove) + "New project…" +
+    /// "Create project…".
     fn render_spaces_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let (search, active, focus, list_scroll) = {
             let Some(menu) = self.spaces_menu.get() else {
@@ -472,6 +488,12 @@ impl Shell {
                     SpacesMenuRow::AddSpace => {
                         (row.clone(), SharedString::from("New project…"), None, false)
                     }
+                    SpacesMenuRow::CreateSpace => (
+                        row.clone(),
+                        SharedString::from("Create project…"),
+                        None,
+                        false,
+                    ),
                 })
                 .collect()
         };
@@ -490,10 +512,10 @@ impl Shell {
                         let is_selected = match &row {
                             SpacesMenuRow::All => filter.is_none(),
                             SpacesMenuRow::Space(id) => filter.as_deref() == Some(id.as_str()),
-                            SpacesMenuRow::AddSpace => false,
+                            SpacesMenuRow::AddSpace | SpacesMenuRow::CreateSpace => false,
                         };
                         let leading = match &row {
-                            SpacesMenuRow::AddSpace => icons::PLUS,
+                            SpacesMenuRow::AddSpace | SpacesMenuRow::CreateSpace => icons::PLUS,
                             _ => icons::FOLDER,
                         };
                         let menu_space = match &row {
@@ -889,6 +911,10 @@ impl Shell {
     // ---- add-space flow (the ⌘K palette) ----
 
     pub(super) fn open_add_space(&mut self, cx: &mut Context<Self>) {
+        self.open_add_space_palette(AddSpaceMode::Attach, cx);
+    }
+
+    pub(super) fn open_add_space_palette(&mut self, mode: AddSpaceMode, cx: &mut Context<Self>) {
         let devices: Vec<Device> = self.state.read(cx).devices.clone();
         let local = self.state.read(cx).local_device_id.clone();
         // Land on this device's tab (else the first registered device).
@@ -900,15 +926,22 @@ impl Shell {
         // "PaletteSearch" context: navigation keys stay unbound so ↑↓/←/→/⏎
         // bubble to the palette frame (`add_space_key`) instead of moving the
         // text caret — Enter and ⌘Enter are both handled there.
-        let search =
-            cx.new(|cx| ComposerInput::with_context("Search folders…", "PaletteSearch", cx));
+        let placeholder = match mode {
+            AddSpaceMode::Attach => "Search folders…",
+            AddSpaceMode::Create => "Name the project…",
+        };
+        let search = cx.new(|cx| ComposerInput::with_context(placeholder, "PaletteSearch", cx));
         let search_events = cx.subscribe(&search, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
-                // Typing `/` after a query that names a folder descends into
-                // it — the query reads as a path segment, so the slash IS the
-                // pick (shell-style). Otherwise the slash stays in the query
-                // (it matches nothing, which is honest feedback).
-                if this.add_space_slash_descend(cx) {
+                // Attach only: typing `/` after a query that names a folder
+                // descends into it. Create mode: the query IS the new folder
+                // name and must not be eaten by a path segment.
+                if this
+                    .add_space
+                    .as_ref()
+                    .is_some_and(|f| f.mode == AddSpaceMode::Attach)
+                    && this.add_space_slash_descend(cx)
+                {
                     return;
                 }
                 if let Some(flow) = this.add_space.as_mut() {
@@ -928,6 +961,7 @@ impl Shell {
             active: 0,
             submit_busy: false,
             error: None,
+            mode,
             focus: cx.focus_handle(),
             list_scroll: gpui::ScrollHandle::new(),
             focus_pending: true,
@@ -956,8 +990,11 @@ impl Shell {
         flow.browser_repo = false;
         flow.active = 0;
         flow.error = None;
+        let keep_name = flow.mode == AddSpaceMode::Create;
         let search = flow.search.clone();
-        search.update(cx, |input, cx| input.set_text("", cx));
+        if !keep_name {
+            search.update(cx, |input, cx| input.set_text("", cx));
+        }
         self.load_space_folders(None, cx);
         cx.notify();
     }
@@ -972,6 +1009,9 @@ impl Shell {
             return Vec::new();
         };
         let dirs = browser_rows(listing);
+        if flow.mode == AddSpaceMode::Create {
+            return dirs.into_iter().cloned().collect();
+        }
         let query = flow.search.read(cx).text().to_string();
         let names: Vec<&str> = dirs.iter().map(|e| e.name.as_str()).collect();
         popover::filter_indices(&query, &names)
@@ -994,11 +1034,14 @@ impl Shell {
         };
         let full = crate::pickers::child_path(&listing.path, &entry.name);
         let is_repo = entry.is_repo;
+        let keep_name = flow.mode == AddSpaceMode::Create;
         let search = flow.search.clone();
         if let Some(flow) = self.add_space.as_mut() {
             flow.browser_repo = is_repo;
         }
-        search.update(cx, |input, cx| input.set_text("", cx));
+        if !keep_name {
+            search.update(cx, |input, cx| input.set_text("", cx));
+        }
         self.load_space_folders(Some(full), cx);
     }
 
@@ -1045,6 +1088,9 @@ impl Shell {
     /// match is already complete.
     fn add_space_completion(&self, cx: &App) -> Option<(String, String)> {
         let flow = self.add_space.as_ref()?;
+        if flow.mode == AddSpaceMode::Create {
+            return None;
+        }
         let query = flow.search.read(cx).text().to_string();
         if query.is_empty() {
             return None;
@@ -1082,8 +1128,11 @@ impl Shell {
             return;
         };
         flow.browser_repo = is_repo;
+        let keep_name = flow.mode == AddSpaceMode::Create;
         let search = flow.search.clone();
-        search.update(cx, |input, cx| input.set_text("", cx));
+        if !keep_name {
+            search.update(cx, |input, cx| input.set_text("", cx));
+        }
         self.load_space_folders(Some(full), cx);
     }
 
@@ -1144,8 +1193,25 @@ impl Shell {
         }));
     }
 
-    /// Create the space for the browser's current folder.
+    /// Create the space for the browser's current folder, or mkdir + create
+    /// a child of it when the palette is in create mode.
     fn submit_add_space(&mut self, cx: &mut Context<Self>) {
+        let Some(flow) = self.add_space.as_ref() else {
+            return;
+        };
+        if flow.mode == AddSpaceMode::Create {
+            self.submit_create_folder(cx);
+            return;
+        }
+        let Some(listing) = flow.browser.ready() else {
+            return;
+        };
+        let path = listing.path.clone();
+        let git_detected = flow.browser_repo;
+        self.commit_add_space(path, git_detected, cx);
+    }
+
+    fn submit_create_folder(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -1161,8 +1227,86 @@ impl Shell {
         let Some(listing) = flow.browser.ready() else {
             return;
         };
-        let path = listing.path.clone();
-        let git_detected = flow.browser_repo;
+        let name = flow.search.read(cx).text().trim().to_string();
+        if name.is_empty() {
+            if let Some(flow) = self.add_space.as_mut() {
+                flow.error = Some(SharedString::from("Name the project"));
+            }
+            cx.notify();
+            return;
+        }
+        if name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains('\0')
+        {
+            if let Some(flow) = self.add_space.as_mut() {
+                flow.error = Some(SharedString::from("Invalid folder name"));
+            }
+            cx.notify();
+            return;
+        }
+        let full = crate::pickers::child_path(&listing.path, &name);
+        let local = self.state.read(cx).local_device_id.clone();
+        let mut params = serde_json::Map::new();
+        params.insert("path".into(), serde_json::Value::String(full.clone()));
+        if local.as_deref() != Some(device.id.as_str()) {
+            params.insert(
+                "targetDeviceId".into(),
+                serde_json::Value::String(device.id.clone()),
+            );
+        }
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.submit_busy = true;
+            flow.error = None;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::CREATE_FOLDER, serde_json::Value::Object(params))
+                .await;
+            this.update(cx, |shell, cx| match result {
+                Ok(value) => {
+                    let path = value
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(full.as_str())
+                        .to_string();
+                    if let Some(flow) = shell.add_space.as_mut() {
+                        flow.submit_busy = false;
+                    }
+                    shell.commit_add_space(path, false, cx);
+                }
+                Err(err) => {
+                    if let Some(flow) = shell.add_space.as_mut() {
+                        flow.submit_busy = false;
+                        flow.error = Some(format!("{err}").into());
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.submit_task = Some(task);
+        }
+        cx.notify();
+    }
+
+    fn commit_add_space(&mut self, path: String, git_detected: bool, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let Some(flow) = self.add_space.as_ref() else {
+            return;
+        };
+        if flow.submit_busy {
+            return;
+        }
+        let Some(device) = flow.device.clone() else {
+            return;
+        };
         // Same (device, folder) already has a space → just switch to it. The
         // engine dedupes this case too (a createSpace for a duplicate pair
         // no-ops), so creating would leave the minted id dangling.
@@ -1276,7 +1420,13 @@ impl Shell {
             // Unbound in "PaletteSearch" (like enter), so it bubbles here
             // instead of editing text or moving focus.
             "tab" => {
-                self.add_space_accept_completion(cx);
+                if self
+                    .add_space
+                    .as_ref()
+                    .is_some_and(|f| f.mode == AddSpaceMode::Attach)
+                {
+                    self.add_space_accept_completion(cx);
+                }
                 return;
             }
             _ => {}
@@ -1352,6 +1502,7 @@ impl Shell {
             focus,
             list_scroll,
             home,
+            create_mode,
         ) = {
             let flow = self.add_space.as_ref()?;
             (
@@ -1366,6 +1517,7 @@ impl Shell {
                 flow.focus.clone(),
                 flow.list_scroll.clone(),
                 flow.home.clone(),
+                flow.mode == AddSpaceMode::Create,
             )
         };
         let devices = self.state.read(cx).devices.clone();
@@ -1437,9 +1589,19 @@ impl Shell {
                         .size(px(11.0))
                         .text_color(theme.on_solid.opacity(0.8)),
                 )
-                .child(SharedString::from("Enter"))
+                .child(SharedString::from(if create_mode {
+                    "Create"
+                } else {
+                    "Enter"
+                }))
             })
-            .when(submit_busy, |el| el.child(SharedString::from("Adding…")));
+            .when(submit_busy, |el| {
+                el.child(SharedString::from(if create_mode {
+                    "Creating…"
+                } else {
+                    "Adding…"
+                }))
+            });
         // Header and footer sit a shade DEEPER than the body (the shared
         // recessed-band tone) — the bands frame the folder list, which stays
         // on the brighter tint.
@@ -1629,7 +1791,7 @@ impl Shell {
                 .py(px(16.0))
                 .text_size(px(12.5))
                 .text_color(theme.text_faint)
-                .child(SharedString::from(if query_empty {
+                .child(SharedString::from(if query_empty || create_mode {
                     "No folders here"
                 } else {
                     "No folders match"
@@ -1845,7 +2007,9 @@ impl Shell {
             ))
             .child(popover::key_hint(&theme, icons::ARROW_LEFT, "Up"))
             .child(popover::key_hint(&theme, icons::ARROW_RIGHT, "Open"))
-            .child(popover::key_hint_text(&theme, "tab", "Complete"))
+            .when(!create_mode, |el| {
+                el.child(popover::key_hint_text(&theme, "tab", "Complete"))
+            })
             .when_some(error, |el, message| {
                 el.child(
                     div()

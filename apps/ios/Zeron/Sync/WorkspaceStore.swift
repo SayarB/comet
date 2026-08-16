@@ -282,6 +282,14 @@ final class WorkspaceStore {
         return try await relay(for: deviceId).call(method: "ListFolders", params: params)
     }
 
+    /// CreateFolder on the target device — one new directory (parent must exist).
+    func createFolder(deviceId: String, path: String) async throws -> String {
+        struct Reply: Decodable { var path: String }
+        let reply: Reply = try await relay(for: deviceId)
+            .call(method: "CreateFolder", params: ["path": path])
+        return reply.path
+    }
+
     /// ListRefs on the target device — branches with current/worktree markers
     /// (default branch first, per the engine's ordering).
     func listRefs(deviceId: String, repoPath: String) async -> [RepoRef]? {

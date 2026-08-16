@@ -106,13 +106,31 @@ final class DemoDataset {
         deviceId == "dev-vps" ? "/srv" : "/Users/dev"
     }
 
-    private static let repoNames: Set<String> = ["zeron", "dotfiles", "blog", "playground", "edge", "landing"]
+    private     static let repoNames: Set<String> = ["zeron", "dotfiles", "blog", "playground", "edge", "landing"]
+
+    /// Folders created in this demo session, keyed by parent path.
+    private var extraChildren: [String: [String]] = [:]
 
     func listFolders(deviceId: String, path: String) -> FolderListing {
-        let entries = (Self.fileTree[path] ?? []).map { name in
+        let names = (Self.fileTree[path] ?? []) + (extraChildren[path] ?? [])
+        let entries = names.map { name in
             FolderEntry(name: name, isDir: true, isRepo: Self.repoNames.contains(name))
         }
         return FolderListing(path: path, entries: entries, truncated: false)
+    }
+
+    func createFolder(parent: String, name: String) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != ".", trimmed != "..",
+              !trimmed.contains("/"), !trimmed.contains("\\"), !trimmed.contains("\0") else {
+            return nil
+        }
+        let existing = (Self.fileTree[parent] ?? []) + (extraChildren[parent] ?? [])
+        if existing.contains(trimmed) { return nil }
+        extraChildren[parent, default: []].append(trimmed)
+        let child = parent.hasSuffix("/") ? parent + trimmed : "\(parent)/\(trimmed)"
+        extraChildren[child] = []
+        return child
     }
 
     private var refsByPath: [String: [RepoRef]] = [:]

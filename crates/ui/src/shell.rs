@@ -60,7 +60,13 @@ use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
 actions!(
     shell,
-    [ToggleSidebar, ToggleChanges, AddSpacePalette, NewSession]
+    [
+        ToggleSidebar,
+        ToggleChanges,
+        AddSpacePalette,
+        CreateSpacePalette,
+        NewSession
+    ]
 );
 
 // ---------------------------------------------------------------------------
@@ -6326,6 +6332,14 @@ impl Render for Shell {
                     cx.notify();
                 } else {
                     this.open_add_space(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CreateSpacePalette, _, cx| {
+                if this.add_space.is_some() {
+                    this.add_space = None;
+                    cx.notify();
+                } else {
+                    this.open_add_space_palette(spaces::AddSpaceMode::Create, cx);
                 }
             }));
 

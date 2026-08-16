@@ -429,6 +429,61 @@ async fn folder_lister_timeout_path() {
     );
 }
 
+#[test]
+fn folder_create_makes_and_rejects() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let parent = tmp.path().join("projects");
+    std::fs::create_dir(&parent).expect("parent");
+    let data = tempfile::tempdir().expect("data dir");
+    let repos = test_repos(data.path());
+
+    let named = parent.join("my app");
+    let created = repos
+        .create_folder(&named.to_string_lossy())
+        .expect("create folder");
+    assert_eq!(created, named.to_string_lossy());
+    assert!(named.is_dir());
+    assert_ne!(
+        named,
+        data.path().join("repos").join("my app"),
+        "CreateFolder must not land in {{data_dir}}/repos"
+    );
+
+    let err = repos
+        .create_folder(&named.to_string_lossy())
+        .expect_err("existing path rejected");
+    assert!(
+        err.to_string().contains("Already exists"),
+        "unexpected error: {err}"
+    );
+
+    for bad in [
+        String::new(),
+        ".".into(),
+        parent.join("..").to_string_lossy().into_owned(),
+        parent.join("has/slash").to_string_lossy().into_owned(),
+        parent.join("has\\slash").to_string_lossy().into_owned(),
+    ] {
+        assert!(
+            repos.create_folder(&bad).is_err(),
+            "expected reject for {bad:?}"
+        );
+    }
+    assert!(
+        !parent.join("has").exists(),
+        "rejecting a nested name must not mkdir intermediates"
+    );
+    let missing = tmp.path().join("nope").join("child");
+    let err = repos
+        .create_folder(&missing.to_string_lossy())
+        .expect_err("missing parent");
+    assert!(
+        err.to_string().contains("No such folder"),
+        "unexpected error: {err}"
+    );
+    assert!(!missing.exists());
+}
+
 // ---------------------------------------------------------------------------
 // Diff capture
 // ---------------------------------------------------------------------------
@@ -1176,6 +1231,30 @@ async fn rpc_dispatch_for_m5_methods() {
     assert_eq!(
         folders["path"].as_str(),
         Some(&*tmp.path().to_string_lossy())
+    );
+
+    let created_path = tmp.path().join("fresh-project");
+    let created = client
+        .call(
+            methods::CREATE_FOLDER,
+            serde_json::json!({ "path": created_path.to_string_lossy() }),
+        )
+        .await
+        .expect("CreateFolder");
+    assert_eq!(
+        created["path"].as_str(),
+        Some(&*created_path.to_string_lossy())
+    );
+    assert!(created_path.is_dir());
+    assert!(
+        client
+            .call(
+                methods::CREATE_FOLDER,
+                serde_json::json!({ "path": created_path.to_string_lossy() }),
+            )
+            .await
+            .is_err(),
+        "duplicate CreateFolder rejected"
     );
 
     // CreateWorktree / DeleteWorktree.

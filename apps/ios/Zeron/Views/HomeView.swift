@@ -15,6 +15,7 @@ struct HomeView: View {
     @Environment(AppModel.self) private var model
     @State private var path: [Route] = []
     @State private var showNewSpace = false
+    @State private var createProject = false
     // "" = All. Sticky across launches; falls back to All if the space is gone.
     @AppStorage("homeSpaceFilter") private var spaceFilter: String = ""
 
@@ -87,8 +88,12 @@ struct HomeView: View {
                 }
             }
             .sheet(isPresented: $showNewSpace) {
-                NewSpaceSheet { spaceId in
-                    path.append(.space(spaceId))
+                NewSpaceSheet(creates: createProject) { spaceId in
+                    if createProject {
+                        path = [.space(spaceId), .newSession(spaceId: spaceId)]
+                    } else {
+                        path.append(.space(spaceId))
+                    }
                 }
             }
             .task(id: model.overviewChats.map(\.id).joined()) {
@@ -108,6 +113,7 @@ struct HomeView: View {
                 }
                 if model.launchSheet == "newspace" {
                     model.launchSheet = nil
+                    createProject = false
                     showNewSpace = true
                 }
             }
@@ -130,9 +136,16 @@ struct HomeView: View {
             }
             Divider()
             Button {
+                createProject = false
                 showNewSpace = true
             } label: {
                 Label("New space…", systemImage: "folder.badge.plus")
+            }
+            Button {
+                createProject = true
+                showNewSpace = true
+            } label: {
+                Label("Create project…", systemImage: "plus.rectangle.on.folder")
             }
         } label: {
             HStack(spacing: 5) {
@@ -192,6 +205,7 @@ struct HomeView: View {
             .accessibilityLabel("New session")
         } else if model.spaces.isEmpty {
             Button {
+                createProject = false
                 showNewSpace = true
             } label: {
                 Image(systemName: "plus")
