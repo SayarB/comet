@@ -62,6 +62,8 @@ pub struct AppearanceState {
     /// Where `ui-settings.json` lives, so a menu action can persist the choice
     /// without routing through the shell entity that normally owns settings.
     pub data_dir: PathBuf,
+    /// Markdown body in the editorial serif (Iowan Old Style on macOS).
+    pub markdown_serif: bool,
 }
 
 impl Global for AppearanceState {}
@@ -79,15 +81,22 @@ pub fn resolve(mode: AppearanceMode, system: Appearance) -> Appearance {
 /// before any window opens, so the first frame is already the right palette
 /// (installing later produces a visible dark-to-light flash).
 pub fn init(mode: AppearanceMode, data_dir: impl Into<PathBuf>, cx: &mut App) {
+    let data_dir = data_dir.into();
+    let markdown_serif = UiSettings::load(&data_dir).markdown_serif;
     let system = Appearance::from_window(cx.window_appearance());
-    tracing::debug!(?mode, ?system, "appearance: initial");
+    tracing::debug!(?mode, ?system, markdown_serif, "appearance: initial");
     cx.set_global(AppearanceState {
         mode,
         system,
-        data_dir: data_dir.into(),
+        data_dir,
+        markdown_serif,
     });
     sync_ns_appearance(mode);
     Theme::install(resolve(mode, system), cx);
+    cx.global_mut::<Theme>().markdown_serif = markdown_serif;
+    if markdown_serif {
+        crate::theme::bump_theme_generation();
+    }
 }
 
 /// The mode currently in effect (defaults to `System` before [`init`]).
@@ -113,6 +122,32 @@ pub fn set_mode(mode: AppearanceMode, cx: &mut App) {
     persist(mode, &data_dir);
 }
 
+/// The markdown serif toggle currently in effect.
+pub fn markdown_serif(cx: &App) -> bool {
+    cx.try_global::<AppearanceState>()
+        .map(|s| s.markdown_serif)
+        .unwrap_or(false)
+}
+
+/// Flip the editorial-serif toggle for markdown body, persist, and force a
+/// full repaint so cached markdown runs reshaped under the new family.
+pub fn set_markdown_serif(on: bool, cx: &mut App) {
+    if !cx.has_global::<AppearanceState>() {
+        return;
+    }
+    let state = cx.global_mut::<AppearanceState>();
+    if state.markdown_serif == on {
+        return;
+    }
+    state.markdown_serif = on;
+    let data_dir = state.data_dir.clone();
+    if cx.has_global::<Theme>() {
+        cx.global_mut::<Theme>().markdown_serif = on;
+    }
+    persist_markdown_serif(on, &data_dir);
+    cx.refresh_windows();
+}
+
 /// Read-modify-write `ui-settings.json` for just the appearance key.
 ///
 /// Deliberately a fresh load rather than a write of some cached struct: the
@@ -124,6 +159,14 @@ fn persist(mode: AppearanceMode, data_dir: &Path) {
     settings.appearance = mode;
     if let Err(err) = settings.save(data_dir) {
         tracing::warn!(error = %err, "could not persist appearance");
+    }
+}
+
+fn persist_markdown_serif(on: bool, data_dir: &Path) {
+    let mut settings = UiSettings::load(data_dir);
+    settings.markdown_serif = on;
+    if let Err(err) = settings.save(data_dir) {
+        tracing::warn!(error = %err, "could not persist markdown serif");
     }
 }
 

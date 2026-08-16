@@ -636,8 +636,11 @@ const MENTION_TOOLTIP_DELAY: Duration = Duration::from_millis(420);
 const MENTION_TOOLTIP_HEIGHT: f32 = 24.0;
 const MENTION_SIDE_PAD: &str = "\u{00A0}";
 /// A private URI scheme keeps file mentions distinguishable from ordinary
-/// Markdown links pasted into the composer.
-const FILE_MENTION_SCHEME: &str = "zeron-file:";
+/// Markdown links pasted into the composer. Shared with the file viewer's link
+/// classifier ([`crate::file_viewer::classify_link`]) so both ends of a
+/// mention — writing it here, opening it from the transcript — agree on one
+/// set of rules.
+pub(crate) const FILE_MENTION_SCHEME: &str = "zeron-file:";
 
 /// A restorable point in the input's history: text plus where the caret and
 /// selection sat when the edit landed.
@@ -672,7 +675,9 @@ fn percent_encode_path(path: &str) -> String {
     out
 }
 
-fn percent_decode_path(encoded: &str) -> Option<String> {
+/// Decode a [`FILE_MENTION_SCHEME`] target back into a path. `None` for
+/// malformed escapes or non-UTF-8 bytes.
+pub(crate) fn percent_decode_path(encoded: &str) -> Option<String> {
     let mut bytes = Vec::with_capacity(encoded.len());
     let raw = encoded.as_bytes();
     let mut at = 0;

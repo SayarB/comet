@@ -1454,6 +1454,16 @@ pub struct Transcript {
     _observe: Subscription,
 }
 
+/// What the transcript asks the shell to do on its behalf.
+pub enum TranscriptEvent {
+    /// A workspace file link was clicked — open (or replace) the file viewer.
+    /// The path is already classified and decoded
+    /// ([`crate::file_viewer::classify_link`]); external URLs never get here.
+    OpenWorkspaceFile(String),
+}
+
+impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
+
 /// One sidecar blob fetch's lifecycle.
 enum BlobFetch {
     Loading(#[allow(dead_code)] Task<()>),
@@ -2790,6 +2800,10 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    on_link: Some(self.link_ui(cx)),
+                    tufte: false,
+                    select_code: false,
+                    select_pad_x: 0.0,
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -2832,6 +2846,10 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    on_link: Some(self.link_ui(cx)),
+                    tufte: false,
+                    select_code: false,
+                    select_pad_x: 0.0,
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -2964,6 +2982,25 @@ impl Transcript {
                     .children(trailer),
             )
             .into_any_element()
+    }
+
+    /// Link dispatch for rendered markdown: workspace paths become an
+    /// [`TranscriptEvent::OpenWorkspaceFile`] for the shell's file viewer,
+    /// everything else keeps the platform's open-url behavior.
+    fn link_ui(&self, cx: &mut Context<Self>) -> render::LinkHandler {
+        let entity = cx.weak_entity();
+        Rc::new(move |target: &str, _window, cx: &mut gpui::App| {
+            match crate::file_viewer::classify_link(target) {
+                crate::file_viewer::LinkTarget::WorkspacePath(path) => {
+                    entity
+                        .update(cx, |_, cx| {
+                            cx.emit(TranscriptEvent::OpenWorkspaceFile(path))
+                        })
+                        .ok();
+                }
+                crate::file_viewer::LinkTarget::External => cx.open_url(target),
+            }
+        })
     }
 
     /// Copy-button wiring for one row's code blocks ([`render::CopyUi`]):
@@ -3517,7 +3554,7 @@ fn user_bubble_text(
     let sel_theme = theme.clone();
     let underlay = canvas(
         |_, _, _| (),
-        move |_, _, window, _| {
+        move |bounds, _, window, _| {
             for span in mentions.iter() {
                 for rect in render::range_rects(&layout, &span.range, 0.0, 2.0) {
                     window.paint_quad(quad(
@@ -3530,7 +3567,9 @@ fn user_bubble_text(
                     ));
                 }
             }
-            render::paint_text_selection(window, &sel_key, &text, &layout, &sel_theme);
+            render::paint_text_selection(
+                window, &sel_key, &text, &layout, &sel_theme, bounds, false,
+            );
         },
     )
     .absolute()
@@ -3542,12 +3581,15 @@ fn user_bubble_text(
         .into_any_element()
 }
 
-/// The transcript ErrorChip — an exact port of zeron chat-view.tsx
-/// `ErrorChip`: a 34px row (`rounded-[10px] border border-red-400/[0.16]
+/// The transcript ErrorChip — a port of zeron chat-view.tsx `ErrorChip`
+/// (34px-minimum row, `rounded-[10px] border border-red-400/[0.16]
 /// bg-red-400/[0.05] px-2 text-[12px]`) with a 20px red-washed tile holding a
 /// 12px DangerTriangle (`bg-red-400/[0.12] text-red-300/80`), a medium
-/// "Error" label, then the human message truncating at `text-foreground/80` —
-/// a subtle red-tinted wash, never a bare red-stroke box.
+/// "Error" label, then the human message at `text-foreground/80` — a subtle
+/// red-tinted wash, never a bare red-stroke box. Unlike the web port, the
+/// message WRAPS instead of truncating: startup-crash errors carry the
+/// agent's exit status and stderr, and a one-line ellipsis was exactly what
+/// made zeronsh/comet#95 undiagnosable from the screenshot.
 fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
     let red_300 = theme.danger_muted; // tailwind red-300
     let danger = theme.danger; // red-400
@@ -3556,7 +3598,7 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
         .w_full()
         .child(
             div()
-                .h(px(34.0))
+                .min_h(px(34.0))
                 .w_full()
                 .flex()
                 .items_center()
@@ -3567,6 +3609,7 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                 .border_color(danger.opacity(0.16))
                 .bg(danger.opacity(0.05))
                 .px(px(8.0))
+                .py(px(7.0))
                 .text_size(px(12.0))
                 .child(
                     div()
@@ -3594,7 +3637,6 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                     div()
                         .min_w_0()
                         .flex_1()
-                        .truncate()
                         .text_color(theme.text.opacity(0.8))
                         .child(message),
                 ),

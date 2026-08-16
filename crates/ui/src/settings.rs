@@ -95,6 +95,9 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Paint opened files in a Tufte reading layout (serif, centered
+    /// headings). Chat markdown never reads this flag.
+    pub markdown_serif: bool,
 }
 
 impl Default for UiSettings {
@@ -117,6 +120,7 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            markdown_serif: true,
         }
     }
 }
@@ -132,14 +136,16 @@ pub enum ShortcutId {
     ToggleChanges,
     ToggleTerminal,
     NewSession,
+    OpenFile,
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 4] = [
+    pub const ALL: [ShortcutId; 5] = [
         ShortcutId::ToggleSidebar,
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleTerminal,
         ShortcutId::NewSession,
+        ShortcutId::OpenFile,
     ];
 
     /// Row label (zeron lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
@@ -149,6 +155,7 @@ impl ShortcutId {
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
             ShortcutId::NewSession => "New session",
+            ShortcutId::OpenFile => "Open file",
         }
     }
 
@@ -158,6 +165,7 @@ impl ShortcutId {
             ShortcutId::ToggleChanges => "mod-b",
             ShortcutId::ToggleTerminal => "mod-j",
             ShortcutId::NewSession => "mod-n",
+            ShortcutId::OpenFile => "mod-p",
         }
     }
 }
@@ -171,6 +179,12 @@ pub struct KeymapConfig {
     pub toggle_changes: String,
     pub toggle_terminal: String,
     pub new_session: String,
+    #[serde(default = "default_open_file_combo")]
+    pub open_file: String,
+}
+
+fn default_open_file_combo() -> String {
+    ShortcutId::OpenFile.default_combo().into()
 }
 
 impl Default for KeymapConfig {
@@ -180,6 +194,7 @@ impl Default for KeymapConfig {
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
             new_session: ShortcutId::NewSession.default_combo().into(),
+            open_file: ShortcutId::OpenFile.default_combo().into(),
         }
     }
 }
@@ -191,6 +206,7 @@ impl KeymapConfig {
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
             ShortcutId::NewSession => &self.new_session,
+            ShortcutId::OpenFile => &self.open_file,
         }
     }
 
@@ -200,6 +216,7 @@ impl KeymapConfig {
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
             ShortcutId::NewSession => self.new_session = combo,
+            ShortcutId::OpenFile => self.open_file = combo,
         }
     }
 
@@ -388,6 +405,7 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            markdown_serif: true,
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
@@ -406,6 +424,10 @@ mod tests {
         .unwrap();
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
+        assert!(
+            loaded.markdown_serif,
+            "pre-tufte files default to Tufte in the file viewer"
+        );
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
         assert!(
@@ -468,6 +490,17 @@ mod tests {
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
         keymap.reset(ShortcutId::ToggleSidebar);
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-s");
+        assert_eq!(keymap.get(ShortcutId::OpenFile), "mod-p");
+        assert!(ShortcutId::ALL.contains(&ShortcutId::OpenFile));
+    }
+
+    #[test]
+    fn keymap_missing_open_file_defaults_to_mod_p() {
+        let keymap: KeymapConfig = serde_json::from_str(
+            r#"{"toggleSidebar":"mod-s","toggleChanges":"mod-b","toggleTerminal":"mod-j","newSession":"mod-n"}"#,
+        )
+        .unwrap();
+        assert_eq!(keymap.get(ShortcutId::OpenFile), "mod-p");
     }
 
     #[test]

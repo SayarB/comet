@@ -1173,6 +1173,64 @@ fn compare_file_matches(
         .then_with(|| path_a.cmp(path_b))
 }
 
+fn collect_search_walk<F: Fn() -> bool>(
+    walker: ignore::Walk,
+    root: &Path,
+    query: &str,
+    featured: &HashMap<String, usize>,
+    matches: &mut Vec<RankedFileMatch>,
+    cancelled: &F,
+) -> Result<(), EngineError> {
+    for entry in walker {
+        if cancelled() {
+            return Err(EngineError::Other("file search cancelled".into()));
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                tracing::debug!(%err, "file mention search walk skipped entry");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if relative.starts_with(".git/") || relative == ".git" {
+            continue;
+        }
+        if matches
+            .iter()
+            .any(|(_, _, existing, _)| existing == &relative)
+        {
+            continue;
+        }
+        let Some(path_score) = fuzzy_score(query, &relative) else {
+            continue;
+        };
+        let score = relative
+            .rsplit('/')
+            .next()
+            .and_then(|name| fuzzy_score(query, name))
+            .unwrap_or_else(|| path_score.saturating_add(1_000));
+        matches.push((
+            featured.get(&relative).copied(),
+            score,
+            relative,
+            entry.file_type().is_some_and(|kind| kind.is_dir()),
+        ));
+        if matches.len() > FILE_SEARCH_MAX_RESULTS {
+            matches.sort_by(|a, b| compare_file_matches(query, a, b));
+            matches.truncate(FILE_SEARCH_MAX_RESULTS);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn search_files_blocking(
     root: &Path,
@@ -1216,46 +1274,21 @@ fn search_files_blocking_with_cancel<F: Fn() -> bool>(
         .git_exclude(true)
         .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
         .build();
-    for entry in walker {
-        if cancelled() {
-            return Err(EngineError::Other("file search cancelled".into()));
-        }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                tracing::debug!(%err, "file mention search walk skipped entry");
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path == root {
-            continue;
-        }
-        let Ok(relative) = path.strip_prefix(&root) else {
-            continue;
-        };
-        let relative = relative.to_string_lossy().replace('\\', "/");
-        if relative.starts_with(".git/") || relative == ".git" {
-            continue;
-        }
-        let Some(path_score) = fuzzy_score(query, &relative) else {
-            continue;
-        };
-        let score = relative
-            .rsplit('/')
-            .next()
-            .and_then(|name| fuzzy_score(query, name))
-            .unwrap_or_else(|| path_score.saturating_add(1_000));
-        matches.push((
-            featured.get(&relative).copied(),
-            score,
-            relative,
-            entry.file_type().is_some_and(|kind| kind.is_dir()),
-        ));
-        if matches.len() > FILE_SEARCH_MAX_RESULTS {
-            matches.sort_by(|a, b| compare_file_matches(query, a, b));
-            matches.truncate(FILE_SEARCH_MAX_RESULTS);
-        }
+    collect_search_walk(walker, &root, query, &featured, &mut matches, &cancelled)?;
+    // `.plans/` is gitignored so Orchesto notes stay local. A whitelist override
+    // cannot un-ignore just that tree — any whitelist glob hides every other
+    // file — so walk it separately with ignore rules off.
+    let plans = root.join(".plans");
+    if plans.is_dir() {
+        let walker = ignore::WalkBuilder::new(&plans)
+            .hidden(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false)
+            .parents(false)
+            .build();
+        collect_search_walk(walker, &root, query, &featured, &mut matches, &cancelled)?;
     }
     matches.sort_by(|a, b| compare_file_matches(query, a, b));
     Ok(matches
@@ -1567,6 +1600,31 @@ mod tests {
                 .any(|entry| entry.path == ".secret")
         );
         assert!(!matches.iter().any(|entry| entry.path.starts_with(".git/")));
+    }
+
+    #[test]
+    fn search_files_includes_gitignored_plans() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join(".gitignore"), ".plans/\nignored/\n").unwrap();
+        std::fs::create_dir_all(root.path().join(".plans/file-quick-open")).unwrap();
+        std::fs::write(root.path().join(".plans/file-quick-open/plan.md"), "").unwrap();
+        std::fs::create_dir(root.path().join("ignored")).unwrap();
+        std::fs::write(root.path().join("ignored/nope.rs"), "").unwrap();
+
+        let matches = search_files_blocking(root.path(), "plan", &[]).unwrap();
+        assert!(
+            matches
+                .iter()
+                .any(|entry| entry.path == ".plans/file-quick-open/plan.md" && !entry.is_dir),
+            "{matches:?}"
+        );
+        assert!(
+            !matches
+                .iter()
+                .any(|entry| entry.path.starts_with("ignored")),
+            "{matches:?}"
+        );
     }
 
     #[test]

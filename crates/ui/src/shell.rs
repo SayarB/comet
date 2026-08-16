@@ -28,6 +28,8 @@ use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
+use crate::file_open::{FileOpenEvent, FileOpenPalette};
+use crate::file_viewer::{FileViewer, FileViewerEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
@@ -51,7 +53,7 @@ use crate::state::{
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
-use crate::transcript::{self, Transcript};
+use crate::transcript::{self, Transcript, TranscriptEvent};
 
 mod spaces;
 mod tabs;
@@ -82,7 +84,13 @@ impl EditorTarget {
 
 actions!(
     shell,
-    [ToggleSidebar, ToggleChanges, AddSpacePalette, NewSession]
+    [
+        ToggleSidebar,
+        ToggleChanges,
+        AddSpacePalette,
+        NewSession,
+        OpenFilePalette
+    ]
 );
 
 // ---------------------------------------------------------------------------
@@ -165,6 +173,11 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         KeyBinding::new(
             &valid_or_default(&keymap.new_session, "mod-n"),
             NewSession,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.open_file, "mod-p"),
+            OpenFilePalette,
             None,
         ),
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
@@ -773,6 +786,12 @@ pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
+    /// Read-only preview of a workspace file clicked in the transcript. It
+    /// overlays the message area only — the composer stays visible, focused,
+    /// and usable underneath it.
+    file_viewer: Entity<FileViewer>,
+    file_open: Option<Entity<FileOpenPalette>>,
+    file_open_sub: Option<Subscription>,
     /// External file drag hovering the conversation column — shows the
     /// "Drop images to attach" veil over the whole chat area; a drop stages
     /// the files in the composer.
@@ -946,6 +965,8 @@ pub struct Shell {
     _ticker: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
+    _transcript_events: Subscription,
+    _file_viewer_events: Subscription,
 }
 
 impl Shell {
@@ -956,15 +977,40 @@ impl Shell {
         });
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let file_viewer = cx.new(|cx| FileViewer::new(state.clone(), cx));
+        // A workspace link in a reply opens the viewer over the transcript.
+        // Focus is deliberately left where it is (the composer): reading a
+        // file must not interrupt a draft.
+        let transcript_events = cx.subscribe(&transcript, {
+            let file_viewer = file_viewer.clone();
+            move |_this: &mut Shell, _, event: &TranscriptEvent, cx| {
+                let TranscriptEvent::OpenWorkspaceFile(path) = event;
+                let path = path.clone();
+                file_viewer.update(cx, |viewer, cx| viewer.open(path, cx));
+            }
+        });
+        let file_viewer_events =
+            cx.subscribe(
+                &file_viewer,
+                |_this: &mut Shell, _, event, cx| match event {
+                    FileViewerEvent::Closed => cx.notify(),
+                },
+            );
         // Every send glides the prompt to the viewport top and reserves the
         // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
+            let file_viewer = file_viewer.clone();
             move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
                 ComposerEvent::Sent {
                     chat_id,
                     message_id,
                 } => {
+                    // Sending is a return to the conversation: the prompt (and
+                    // the reply it reserves space for) is what the user now
+                    // wants to watch, so a file left open from reading gets out
+                    // of the way instead of hiding its own send.
+                    file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
                     transcript.update(cx, |t, cx| {
                         t.on_own_send(chat_id.clone(), message_id.clone(), cx)
                     });
@@ -1039,6 +1085,9 @@ impl Shell {
             state,
             transcript,
             composer,
+            file_viewer,
+            file_open: None,
+            file_open_sub: None,
             file_drag_active: false,
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
@@ -1125,6 +1174,8 @@ impl Shell {
             _ticker: ticker,
             _state_observation: observation,
             _composer_events: composer_events,
+            _transcript_events: transcript_events,
+            _file_viewer_events: file_viewer_events,
         }
     }
 
@@ -1305,6 +1356,12 @@ impl Shell {
         let selected = state.read(cx).selected_chat.clone().unwrap_or_default();
         if selected != self.active_chat {
             self.active_chat = selected;
+            // A previewed file belongs to the workspace of the chat that
+            // opened it — never leave it on screen over another session.
+            let chat = (!self.active_chat.is_empty()).then(|| self.active_chat.clone());
+            self.file_viewer.update(cx, |viewer, cx| {
+                viewer.clear_if_not_chat(chat.as_deref(), cx)
+            });
             // Route history: a chat switch is a navigation. The very first
             // selection off the untouched boot canvas REPLACES that entry —
             // zeron's `/` route redirected into the last-used chat, leaving no
@@ -1767,6 +1824,7 @@ impl Shell {
             // choice.
             let Ok(snapshot) = this.update(cx, |shell, cx| {
                 shell.settings.appearance = crate::appearance::mode(cx);
+                shell.settings.markdown_serif = crate::appearance::markdown_serif(cx);
                 shell.settings.clone()
             }) else {
                 return;
@@ -1853,6 +1911,7 @@ impl Shell {
                 let target = (!chat_id.is_empty()).then_some(chat_id);
                 if self.state.read(cx).selected_chat != target {
                     self.state.update(cx, |s, cx| s.select_chat(target, cx));
+                    self.file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
                 }
             }
             NavEntry::Settings(section) => {
@@ -2067,6 +2126,7 @@ impl Shell {
         self.delete_confirm = None;
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
+            self.file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
         }
         self.composer
             .update(cx, |composer, _| composer.purge_chat(&chat_id));
@@ -4357,6 +4417,9 @@ impl Shell {
         if let Some(overlay) = self.render_add_space_overlay(viewport, window, cx) {
             overlays.push(overlay);
         }
+        if let Some(overlay) = self.render_file_open_overlay(viewport, window, cx) {
+            overlays.push(overlay);
+        }
 
         if let Some(chat_id) = self.delete_confirm.clone() {
             let title = transcript::single_line(
@@ -4596,6 +4659,9 @@ impl Shell {
                     }
                 },
             ))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                this.on_conversation_key(event, cx)
+            }))
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                 this.file_drag_active = false;
                 let paths = paths.paths().to_vec();
@@ -4648,7 +4714,19 @@ impl Shell {
                             .band_top(Theme::TRANSCRIPT_FADE_BAND)
                             .band_bottom(bottom_band),
                         )
-                        .children(self.render_jump_to_bottom(stack_h, cx))
+                        // The pill scrolls the transcript, which a previewed
+                        // file completely covers — leaving it on top of the
+                        // viewer offers a control for content nobody can see.
+                        .children(
+                            (!self.file_viewer.read(cx).is_open())
+                                .then(|| self.render_jump_to_bottom(stack_h, cx))
+                                .flatten(),
+                        )
+                        // Painted last inside the transcript underlay: the
+                        // viewer spans the underlay's full height and slides
+                        // under the glass chrome stack, exactly as the
+                        // transcript it replaces does.
+                        .children(self.render_file_viewer(stack_h, cx))
                 },
             )
             // The glass chrome stack, floating over the transcript's bottom:
@@ -4692,6 +4770,90 @@ impl Shell {
                 )
             })
             .into_any_element()
+    }
+
+    fn close_file_open(&mut self, cx: &mut Context<Self>) {
+        self.file_open = None;
+        self.file_open_sub = None;
+        cx.notify();
+    }
+
+    fn toggle_file_open(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_open.is_some() {
+            self.close_file_open(cx);
+            return;
+        }
+        let state = self.state.clone();
+        let palette = cx.new(|cx| FileOpenPalette::new(state, cx));
+        self.file_open_sub = Some(cx.subscribe(&palette, |this, _, event, cx| match event {
+            FileOpenEvent::Dismissed => this.close_file_open(cx),
+            FileOpenEvent::Open(path) => {
+                let path = path.clone();
+                this.close_file_open(cx);
+                if !matches!(this.route, Route::Chat) {
+                    this.close_settings(cx);
+                }
+                this.file_viewer
+                    .update(cx, |viewer, cx| viewer.open(path, cx));
+                cx.notify();
+            }
+        }));
+        self.file_open = Some(palette);
+        cx.notify();
+    }
+
+    fn render_file_open_overlay(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let palette = self.file_open.clone()?;
+        Some(palette.update(cx, |palette, cx| {
+            palette.render_overlay(viewport, window, cx)
+        }))
+    }
+
+    /// The file viewer as an absolute layer over the transcript: it starts
+    /// below the titlebar (its path header and close control must stay clear
+    /// of the window chrome) and runs to the underlay's bottom edge, so the
+    /// file passes BEHIND the glass composer the same way the transcript does
+    /// instead of stopping short of it in a letterboxed panel (user report).
+    /// The composer keeps painting over it — later sibling in the column — so
+    /// send/steer/stop stay visible and clickable. `stack_h` is the same
+    /// chrome measurement the transcript's bottom fade rides; the viewer uses
+    /// it to keep its own content out from under that chrome at rest.
+    fn render_file_viewer(&mut self, stack_h: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !matches!(self.route, Route::Chat) || !self.file_viewer.read(cx).is_open() {
+            return None;
+        }
+        self.file_viewer.read(cx).set_chrome_inset(stack_h);
+        Some(
+            div()
+                .absolute()
+                .top(px(Theme::TITLEBAR_HEIGHT))
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .child(self.file_viewer.clone())
+                .into_any_element(),
+        )
+    }
+
+    /// Escape while the viewer is open closes it — but only after the
+    /// composer's own dismissals have had their turn. Its `escape` binding
+    /// consumes the key whenever a mention popup is open and propagates
+    /// otherwise, and gpui runs bindings before key listeners, so this
+    /// listener never steals a dismissal that belonged to the composer.
+    fn on_conversation_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        if event.keystroke.key != "escape" || !self.file_viewer.read(cx).is_open() {
+            return;
+        }
+        if self.file_open.is_some() {
+            return;
+        }
+        self.file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
+        cx.notify();
     }
 
     /// The "↓ Scroll to bottom" pill (round-9 §3): a LABELED rounded-full
@@ -6281,6 +6443,9 @@ impl Render for Shell {
                 } else {
                     this.open_add_space(cx);
                 }
+            }))
+            .on_action(cx.listener(|this, _: &OpenFilePalette, window, cx| {
+                this.toggle_file_open(window, cx);
             }));
 
         let render_gate = if restart_required {

@@ -98,6 +98,10 @@ pub mod methods {
     pub const LIST_FOLDERS: &str = "ListFolders";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     pub const SEARCH_FILES: &str = "SearchFiles";
+    /// Bounded read-only text preview of one file inside a chat's checkout —
+    /// the transcript file viewer. Answers with typed preview states rather
+    /// than errors for missing/oversized/binary/out-of-root targets.
+    pub const READ_WORKSPACE_FILE: &str = "ReadWorkspaceFile";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
     /// Device-local worktree root configuration (never relay-forwarded).
