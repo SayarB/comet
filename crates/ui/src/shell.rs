@@ -28,6 +28,7 @@ use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
+use crate::file_open::{FileOpenEvent, FileOpenPalette};
 use crate::file_viewer::{FileViewer, FileViewerEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
@@ -82,7 +83,13 @@ impl EditorTarget {
 
 actions!(
     shell,
-    [ToggleSidebar, ToggleChanges, AddSpacePalette, NewSession]
+    [
+        ToggleSidebar,
+        ToggleChanges,
+        AddSpacePalette,
+        NewSession,
+        OpenFilePalette
+    ]
 );
 
 // ---------------------------------------------------------------------------
@@ -165,6 +172,11 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         KeyBinding::new(
             &valid_or_default(&keymap.new_session, "mod-n"),
             NewSession,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.open_file, "mod-p"),
+            OpenFilePalette,
             None,
         ),
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
@@ -774,6 +786,8 @@ pub struct Shell {
     /// overlays the message area only — the composer stays visible, focused,
     /// and usable underneath it.
     file_viewer: Entity<FileViewer>,
+    file_open: Option<Entity<FileOpenPalette>>,
+    file_open_sub: Option<Subscription>,
     /// External file drag hovering the conversation column — shows the
     /// "Drop images to attach" veil over the whole chat area; a drop stages
     /// the files in the composer.
@@ -1066,6 +1080,8 @@ impl Shell {
             transcript,
             composer,
             file_viewer,
+            file_open: None,
+            file_open_sub: None,
             file_drag_active: false,
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
@@ -4383,6 +4399,9 @@ impl Shell {
         if let Some(overlay) = self.render_add_space_overlay(viewport, window, cx) {
             overlays.push(overlay);
         }
+        if let Some(overlay) = self.render_file_open_overlay(viewport, window, cx) {
+            overlays.push(overlay);
+        }
 
         if let Some(chat_id) = self.delete_confirm.clone() {
             let title = transcript::single_line(
@@ -4735,6 +4754,48 @@ impl Shell {
             .into_any_element()
     }
 
+    fn close_file_open(&mut self, cx: &mut Context<Self>) {
+        self.file_open = None;
+        self.file_open_sub = None;
+        cx.notify();
+    }
+
+    fn toggle_file_open(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_open.is_some() {
+            self.close_file_open(cx);
+            return;
+        }
+        let state = self.state.clone();
+        let palette = cx.new(|cx| FileOpenPalette::new(state, cx));
+        self.file_open_sub = Some(cx.subscribe(&palette, |this, _, event, cx| match event {
+            FileOpenEvent::Dismissed => this.close_file_open(cx),
+            FileOpenEvent::Open(path) => {
+                let path = path.clone();
+                this.close_file_open(cx);
+                if !matches!(this.route, Route::Chat) {
+                    this.close_settings(cx);
+                }
+                this.file_viewer
+                    .update(cx, |viewer, cx| viewer.open(path, cx));
+                cx.notify();
+            }
+        }));
+        self.file_open = Some(palette);
+        cx.notify();
+    }
+
+    fn render_file_open_overlay(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let palette = self.file_open.clone()?;
+        Some(palette.update(cx, |palette, cx| {
+            palette.render_overlay(viewport, window, cx)
+        }))
+    }
+
     /// The file viewer as an absolute layer over the transcript: it starts
     /// below the titlebar (its path header and close control must stay clear
     /// of the window chrome) and runs to the underlay's bottom edge, so the
@@ -4768,6 +4829,9 @@ impl Shell {
     /// listener never steals a dismissal that belonged to the composer.
     fn on_conversation_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
         if event.keystroke.key != "escape" || !self.file_viewer.read(cx).is_open() {
+            return;
+        }
+        if self.file_open.is_some() {
             return;
         }
         self.file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
@@ -6361,6 +6425,9 @@ impl Render for Shell {
                 } else {
                     this.open_add_space(cx);
                 }
+            }))
+            .on_action(cx.listener(|this, _: &OpenFilePalette, window, cx| {
+                this.toggle_file_open(window, cx);
             }));
 
         let render_gate = if restart_required {
