@@ -104,6 +104,9 @@ pub mod methods {
     pub const READ_WORKSPACE_FILE: &str = "ReadWorkspaceFile";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
+    /// Device-local worktree root configuration (never relay-forwarded).
+    pub const GET_WORKTREE_SETTINGS: &str = "GetWorktreeSettings";
+    pub const SET_WORKTREE_ROOT: &str = "SetWorktreeRoot";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";

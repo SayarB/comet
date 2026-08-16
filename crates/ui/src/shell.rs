@@ -42,6 +42,7 @@ use crate::settings::devices::DevicesPage;
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::worktrees::WorktreesPage;
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
@@ -196,17 +197,19 @@ pub enum SettingsSection {
     Appearance,
     Notifications,
     Shortcuts,
+    Worktrees,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 7] = [
+    pub const ALL: [SettingsSection; 8] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
+        SettingsSection::Worktrees,
         SettingsSection::Archived,
     ];
 
@@ -220,6 +223,7 @@ impl SettingsSection {
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
+            SettingsSection::Worktrees => "Worktrees",
             SettingsSection::Archived => "Archived sessions",
         }
     }
@@ -838,6 +842,7 @@ pub struct Shell {
     appearance_page: Option<Entity<AppearancePage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
+    worktrees_page: Option<Entity<WorktreesPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
     shortcuts_sub: Option<Subscription>,
@@ -1049,6 +1054,7 @@ impl Shell {
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
+            Some("settings/worktrees") => Route::Settings(SettingsSection::Worktrees),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
@@ -1105,6 +1111,7 @@ impl Shell {
             appearance_page: None,
             notifications_page: None,
             shortcuts_page: None,
+            worktrees_page: None,
             accounts_page: None,
             harnesses_page: None,
             shortcuts_sub: None,
@@ -2010,6 +2017,16 @@ impl Shell {
                     self.shortcuts_page = Some(page);
                 }
                 match &self.shortcuts_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Worktrees => {
+                if self.worktrees_page.is_none() {
+                    let state = self.state.clone();
+                    self.worktrees_page = Some(cx.new(|cx| WorktreesPage::new(state, cx)));
+                }
+                match &self.worktrees_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -2982,6 +2999,7 @@ impl Shell {
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
+            SettingsSection::Worktrees => icons::GIT_BRANCH,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
         // Match the user's dragged sidebar width — the pane container clips to
@@ -7249,5 +7267,11 @@ mod tests {
             Some(NavEntry::Settings(SettingsSection::Devices))
         );
         assert_eq!(nav.back(), Some(chat("a")));
+    }
+
+    #[test]
+    fn settings_sections_include_worktrees() {
+        assert!(SettingsSection::ALL.contains(&SettingsSection::Worktrees));
+        assert_eq!(SettingsSection::Worktrees.label(), "Worktrees");
     }
 }

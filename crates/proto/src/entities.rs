@@ -273,6 +273,27 @@ pub struct Worktree {
     pub checkout_id: Option<String>,
 }
 
+/// One linked worktree found under the device's effective worktree root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedWorktree {
+    pub repo_name: String,
+    pub name: String,
+    pub path: String,
+}
+
+/// Device-local worktree location settings plus the current read-only inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeSettings {
+    /// The user-saved root. `None` means use the default.
+    pub custom_root: Option<String>,
+    /// The root new worktrees use after environment/default precedence.
+    pub effective_root: String,
+    pub environment_override: bool,
+    pub worktrees: Vec<ManagedWorktree>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderEntry {

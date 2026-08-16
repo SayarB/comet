@@ -138,6 +138,13 @@ struct DeleteWorktreeParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SetWorktreeRootParams {
+    #[serde(default)]
+    custom_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListFoldersParams {
     #[serde(default)]
     path: Option<String>,
@@ -1865,6 +1872,21 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
+            methods::GET_WORKTREE_SETTINGS => {
+                let settings = self
+                    .repos
+                    .worktree_settings()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&settings)
+            }
+            methods::SET_WORKTREE_ROOT => {
+                let p: SetWorktreeRootParams = parse_params(params)?;
+                let settings = self
+                    .repos
+                    .set_worktrees_root(p.custom_root.as_deref())
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&settings)
+            }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
                 // The terminal runs in the chat's checkout; a chat with no cwd (or
@@ -2045,6 +2067,8 @@ mod tests {
         assert!(!forwardable(methods::LOCAL_DEVICE));
         assert!(!forwardable(methods::ENGINE_INFO));
         assert!(!forwardable(methods::ENGINE_READY));
+        assert!(!forwardable(methods::GET_WORKTREE_SETTINGS));
+        assert!(!forwardable(methods::SET_WORKTREE_ROOT));
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
         // The viewer must read through the chat's HOST device, never the UI's
@@ -2190,6 +2214,42 @@ mod tests {
             .expect("read pinned descriptor");
         assert_eq!(text, "inside");
         assert_ne!(text, "outside secret");
+    }
+
+    #[test]
+    fn worktree_settings_rpc_uses_camel_case_shape_and_nullable_root() {
+        let reset: SetWorktreeRootParams =
+            parse_params(serde_json::json!({ "customRoot": null })).unwrap();
+        assert_eq!(reset.custom_root, None);
+        let omitted: SetWorktreeRootParams = parse_params(serde_json::json!({})).unwrap();
+        assert_eq!(omitted.custom_root, None);
+        let set: SetWorktreeRootParams =
+            parse_params(serde_json::json!({ "customRoot": "/tmp/worktrees" })).unwrap();
+        assert_eq!(set.custom_root.as_deref(), Some("/tmp/worktrees"));
+
+        let response = zeron_proto::WorktreeSettings {
+            custom_root: Some("/tmp/worktrees".into()),
+            effective_root: "/tmp/worktrees".into(),
+            environment_override: false,
+            worktrees: vec![zeron_proto::ManagedWorktree {
+                repo_name: "comet".into(),
+                name: "bright-star".into(),
+                path: "/tmp/worktrees/comet/bright-star".into(),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({
+                "customRoot": "/tmp/worktrees",
+                "effectiveRoot": "/tmp/worktrees",
+                "environmentOverride": false,
+                "worktrees": [{
+                    "repoName": "comet",
+                    "name": "bright-star",
+                    "path": "/tmp/worktrees/comet/bright-star"
+                }]
+            })
+        );
     }
 
     #[test]

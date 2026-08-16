@@ -10,6 +10,4 @@ node_modules
 .wrangler
 build/
 edge/dist/
-
-# Orchesto feature plans (local)
-.plans/
+/.plans/
