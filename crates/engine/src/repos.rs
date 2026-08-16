@@ -4,9 +4,9 @@
 //! Repos are device-local (paths differ per machine), so the known set is a plain
 //! JSON list (`{data_dir}/repos.json`) — no sync. Existing repos can live anywhere
 //! the user points us; cloned/created ones land in `{data_dir}/repos`. Worktrees are
-//! created under `~/.zeron/worktrees/<repoName>/<worktreeName>` (NOT the data
-//! dir — worktrees are user-facing working checkouts), with an auto-generated name +
-//! matching `zeron/<name>` branch. `ZERON_WORKTREES_DIR` overrides the root.
+//! created under a device-local root (default `~/.zeron/worktrees`, persisted in
+//! `{data_dir}/worktree-settings.json`) with an auto-generated name + matching
+//! `zeron/<name>` branch. `ZERON_WORKTREES_DIR` overrides the saved root.
 //!
 //! All git access is via subprocess (`tokio::process`) — never libgit2.
 
@@ -15,11 +15,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use zeron_proto::{
     FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit, GitHistoryPage, GitHistoryRef,
-    GitHistoryRefKind, Repo, RepoRef, Worktree,
+    GitHistoryRefKind, ManagedWorktree, Repo, RepoRef, Worktree, WorktreeSettings,
 };
 
 use crate::EngineError;
@@ -38,6 +39,8 @@ const FILE_SEARCH_MAX_RESULTS: usize = 8;
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
 pub const GIT_HISTORY_DEFAULT_LIMIT: usize = 100;
 pub const GIT_HISTORY_MAX_LIMIT: usize = 200;
+const WORKTREE_SETTINGS_FILE: &str = "worktree-settings.json";
+const WORKTREE_LIST_MAX_ENTRIES: usize = 1_000;
 
 const ADJECTIVES: &[&str] = &[
     "swift", "calm", "bright", "bold", "keen", "brave", "clever", "lucky", "quiet", "warm", "cool",
@@ -72,20 +75,17 @@ pub(crate) fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// Where new worktrees live. Deliberately NOT under the backend data dir —
-/// worktrees are user-facing working checkouts. `ZERON_WORKTREES_DIR` overrides
-/// (test isolation); empty reads as unset.
-fn default_worktrees_root() -> PathBuf {
-    std::env::var_os("ZERON_WORKTREES_DIR")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".zeron").join("worktrees"))
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct PersistedWorktreeSettings {
+    custom_root: Option<String>,
 }
 
 struct ReposInner {
     data_dir: PathBuf,
     device_id: String,
-    worktrees_root: PathBuf,
+    /// Tests can pin a root without consulting process environment or disk.
+    fixed_worktrees_root: Option<PathBuf>,
     file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
@@ -95,10 +95,16 @@ pub struct Repos {
 }
 
 impl Repos {
-    /// `data_dir` holds `repos.json` + cloned/created repos; the worktree root
-    /// comes from `$ZERON_WORKTREES_DIR` or `~/.zeron/worktrees`.
+    /// `data_dir` holds `repos.json` plus device-local worktree settings.
     pub fn new(data_dir: &Path, device_id: &str) -> Self {
-        Self::with_worktrees_root(data_dir, device_id, default_worktrees_root())
+        Self {
+            inner: std::sync::Arc::new(ReposInner {
+                data_dir: data_dir.to_path_buf(),
+                device_id: device_id.to_string(),
+                fixed_worktrees_root: None,
+                file_searches: std::sync::Mutex::new(HashMap::new()),
+            }),
+        }
     }
 
     /// Explicit worktree root (tests).
@@ -107,10 +113,166 @@ impl Repos {
             inner: std::sync::Arc::new(ReposInner {
                 data_dir: data_dir.to_path_buf(),
                 device_id: device_id.to_string(),
-                worktrees_root,
+                fixed_worktrees_root: Some(worktrees_root),
                 file_searches: std::sync::Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    fn worktree_settings_path(&self) -> PathBuf {
+        self.inner.data_dir.join(WORKTREE_SETTINGS_FILE)
+    }
+
+    fn load_custom_worktrees_root(&self) -> Option<PathBuf> {
+        let path = self.worktree_settings_path();
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(err) => {
+                tracing::warn!(%err, path = %path.display(), "failed to read worktree settings");
+                return None;
+            }
+        };
+        match serde_json::from_str::<PersistedWorktreeSettings>(&raw) {
+            Ok(settings) => settings.custom_root.map(PathBuf::from),
+            Err(err) => {
+                tracing::warn!(%err, path = %path.display(), "invalid worktree settings");
+                None
+            }
+        }
+    }
+
+    /// `(saved custom root, effective root, environment override)`.
+    fn worktrees_root_state(&self) -> (Option<PathBuf>, PathBuf, bool) {
+        let custom = self.load_custom_worktrees_root();
+        resolve_worktrees_root(
+            self.inner.fixed_worktrees_root.as_deref(),
+            std::env::var_os("ZERON_WORKTREES_DIR")
+                .filter(|s| !s.is_empty())
+                .as_deref(),
+            custom,
+            &home_dir(),
+        )
+    }
+
+    fn normalize_custom_worktrees_root(
+        value: Option<&str>,
+        home: &Path,
+    ) -> Result<Option<PathBuf>, EngineError> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let path = if value == "~" {
+            home.to_path_buf()
+        } else if let Some(rest) = value.strip_prefix("~/") {
+            home.join(rest)
+        } else {
+            PathBuf::from(value)
+        };
+        if !path.is_absolute() {
+            return Err(EngineError::Other(
+                "Worktree location must be an absolute path".into(),
+            ));
+        }
+        Ok(Some(path))
+    }
+
+    fn persist_custom_worktrees_root(&self, root: Option<&Path>) -> Result<(), EngineError> {
+        let path = self.worktree_settings_path();
+        if root.is_none() {
+            match std::fs::remove_file(path) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => return Err(err.into()),
+            }
+        }
+        std::fs::create_dir_all(&self.inner.data_dir)?;
+        let settings = PersistedWorktreeSettings {
+            custom_root: root.map(|path| path.to_string_lossy().to_string()),
+        };
+        let json = serde_json::to_vec_pretty(&settings)
+            .map_err(|err| EngineError::Other(format!("worktree settings serialize: {err}")))?;
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
+    }
+
+    pub fn set_worktrees_root(&self, value: Option<&str>) -> Result<WorktreeSettings, EngineError> {
+        let root = Self::normalize_custom_worktrees_root(value, &home_dir())?;
+        if let Some(root) = &root {
+            std::fs::create_dir_all(root)?;
+            if !root.is_dir() {
+                return Err(EngineError::Other(format!(
+                    "Worktree location is not a directory: {}",
+                    root.display()
+                )));
+            }
+        }
+        self.persist_custom_worktrees_root(root.as_deref())?;
+        self.worktree_settings()
+    }
+
+    pub fn worktree_settings(&self) -> Result<WorktreeSettings, EngineError> {
+        let (custom, effective, environment_override) = self.worktrees_root_state();
+        let worktrees = Self::list_managed_worktrees(&effective)?;
+        Ok(WorktreeSettings {
+            custom_root: custom.map(|path| path.to_string_lossy().to_string()),
+            effective_root: effective.to_string_lossy().to_string(),
+            environment_override,
+            worktrees,
+        })
+    }
+
+    fn list_managed_worktrees(root: &Path) -> Result<Vec<ManagedWorktree>, EngineError> {
+        let repos = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+        let mut worktrees = Vec::new();
+        for repo in repos.flatten() {
+            if worktrees.len() >= WORKTREE_LIST_MAX_ENTRIES {
+                break;
+            }
+            let Ok(file_type) = repo.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let repo_name = repo.file_name().to_string_lossy().to_string();
+            let Ok(entries) = std::fs::read_dir(repo.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if worktrees.len() >= WORKTREE_LIST_MAX_ENTRIES {
+                    break;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_dir() || !entry.path().join(".git").exists() {
+                    continue;
+                }
+                worktrees.push(ManagedWorktree {
+                    repo_name: repo_name.clone(),
+                    name: entry.file_name().to_string_lossy().to_string(),
+                    path: entry.path().to_string_lossy().to_string(),
+                });
+            }
+        }
+        worktrees.sort_by(|a, b| {
+            a.repo_name
+                .to_ascii_lowercase()
+                .cmp(&b.repo_name.to_ascii_lowercase())
+                .then_with(|| {
+                    a.name
+                        .to_ascii_lowercase()
+                        .cmp(&b.name.to_ascii_lowercase())
+                })
+        });
+        Ok(worktrees)
     }
 
     // ── registry (repos.json) ───────────────────────────────────────────────
@@ -625,7 +787,8 @@ impl Repos {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
-        let base = self.inner.worktrees_root.join(&repo_name);
+        let (_, worktrees_root, _) = self.worktrees_root_state();
+        let base = worktrees_root.join(&repo_name);
         std::fs::create_dir_all(&base)?;
         // Auto-generate a name colliding with neither an existing dir nor branch.
         let existing: HashSet<String> = self
@@ -879,6 +1042,24 @@ impl Repos {
             )),
         }
     }
+}
+
+fn resolve_worktrees_root(
+    fixed: Option<&Path>,
+    environment: Option<&std::ffi::OsStr>,
+    custom: Option<PathBuf>,
+    home: &Path,
+) -> (Option<PathBuf>, PathBuf, bool) {
+    if let Some(root) = fixed {
+        return (None, root.to_path_buf(), false);
+    }
+    if let Some(root) = environment {
+        return (custom, PathBuf::from(root), true);
+    }
+    let effective = custom
+        .clone()
+        .unwrap_or_else(|| home.join(".zeron").join("worktrees"));
+    (custom, effective, false)
 }
 
 struct CancelOnDrop(std::sync::Arc<AtomicBool>);
@@ -1218,6 +1399,136 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_root_precedence_is_fixed_then_environment_then_custom_then_default() {
+        let home = Path::new("/home/test");
+        let custom = PathBuf::from("/custom");
+        let environment = std::ffi::OsStr::new("/environment");
+
+        assert_eq!(
+            resolve_worktrees_root(
+                Some(Path::new("/fixed")),
+                Some(environment),
+                Some(custom.clone()),
+                home
+            ),
+            (None, PathBuf::from("/fixed"), false)
+        );
+        assert_eq!(
+            resolve_worktrees_root(None, Some(environment), Some(custom.clone()), home),
+            (Some(custom.clone()), PathBuf::from("/environment"), true)
+        );
+        assert_eq!(
+            resolve_worktrees_root(None, None, Some(custom.clone()), home),
+            (Some(custom.clone()), custom, false)
+        );
+        assert_eq!(
+            resolve_worktrees_root(None, None, None, home),
+            (None, PathBuf::from("/home/test/.zeron/worktrees"), false)
+        );
+    }
+
+    #[test]
+    fn custom_worktree_root_blank_defaults_and_tilde_expands() {
+        let home = Path::new("/home/test");
+        assert_eq!(
+            Repos::normalize_custom_worktrees_root(Some("  "), home).unwrap(),
+            None
+        );
+        assert_eq!(
+            Repos::normalize_custom_worktrees_root(Some("~/checkouts"), home).unwrap(),
+            Some(PathBuf::from("/home/test/checkouts"))
+        );
+        assert!(
+            Repos::normalize_custom_worktrees_root(Some("relative/path"), home)
+                .unwrap_err()
+                .to_string()
+                .contains("absolute")
+        );
+    }
+
+    #[test]
+    fn custom_worktree_root_persists_and_reset_removes_file() {
+        let data = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("fixed-tests"));
+        let custom = data.path().join("custom");
+
+        repos.persist_custom_worktrees_root(Some(&custom)).unwrap();
+        assert_eq!(repos.load_custom_worktrees_root(), Some(custom));
+        repos.persist_custom_worktrees_root(None).unwrap();
+        assert_eq!(repos.load_custom_worktrees_root(), None);
+        assert!(!repos.worktree_settings_path().exists());
+    }
+
+    #[test]
+    fn managed_worktree_inventory_is_filtered_and_sorted() {
+        let root = tempfile::tempdir().unwrap();
+        for (repo, name) in [("zeta", "bravo"), ("alpha", "charlie"), ("alpha", "able")] {
+            let path = root.path().join(repo).join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join(".git"), "gitdir: elsewhere").unwrap();
+        }
+        std::fs::create_dir_all(root.path().join("alpha/not-a-worktree")).unwrap();
+        std::fs::write(root.path().join("README"), "ignore").unwrap();
+
+        let rows = Repos::list_managed_worktrees(root.path()).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.repo_name.as_str(), row.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("alpha", "able"), ("alpha", "charlie"), ("zeta", "bravo")]
+        );
+        assert!(
+            Repos::list_managed_worktrees(&root.path().join("missing"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_root_is_used_by_the_next_worktree_creation() {
+        if std::env::var_os("ZERON_WORKTREES_DIR").is_some() {
+            // Process-level environment intentionally has higher precedence.
+            return;
+        }
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let custom = root.path().join("custom-worktrees");
+        let repos = Repos::new(data.path(), "device");
+        let repo = repos.create("source").await.unwrap();
+        std::fs::write(Path::new(&repo.path).join("README.md"), "initial").unwrap();
+        repos
+            .git(&["add", "README.md"], Some(Path::new(&repo.path)))
+            .await
+            .unwrap();
+        repos
+            .git(
+                &[
+                    "-c",
+                    "user.name=Zeron Test",
+                    "-c",
+                    "user.email=zeron@example.invalid",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                Some(Path::new(&repo.path)),
+            )
+            .await
+            .unwrap();
+
+        let settings = repos
+            .set_worktrees_root(Some(custom.to_str().unwrap()))
+            .unwrap();
+        assert_eq!(settings.effective_root, custom.to_string_lossy());
+        let worktree = repos
+            .create_worktree(Path::new(&repo.path), "main")
+            .await
+            .unwrap();
+        assert!(Path::new(&worktree.path).starts_with(custom.join("source")));
+    }
 
     #[test]
     fn fuzzy_score_matches_a_path_subsequence() {

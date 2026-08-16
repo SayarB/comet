@@ -32,6 +32,7 @@ const CAPTURED_ENV: &[&str] = &[
     "ZERON_CALLBACK_PORT",
     "ZERON_HARNESS",
     "ZERON_DEVICE_NAME",
+    "ZERON_WORKTREES_DIR",
     "RUST_LOG",
 ];
 
