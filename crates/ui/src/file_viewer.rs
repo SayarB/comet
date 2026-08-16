@@ -585,25 +585,31 @@ impl Render for FileViewer {
         div()
             .size_full()
             .flex()
-            .justify_center()
-            // Same recipe as a transcript row: 48px gutters around a 46rem
-            // column, so a markdown file lines up with the chat it covers.
-            .px(px(CHAT_GUTTER))
+            .flex_col()
             .bg(theme.bg)
             .border_t_1()
             .border_color(theme.border)
             .id("file-viewer")
             .occlude()
+            .child(header)
             .child(
+                // Pane is full width; only the page type sits in the chat's
+                // 46rem column so a markdown file doesn't stretch to the edges.
                 div()
-                    .h_full()
+                    .flex_1()
+                    .min_h_0()
                     .w_full()
-                    .max_w(px(MAX_CONTENT_WIDTH))
-                    .min_w_0()
                     .flex()
-                    .flex_col()
-                    .child(header)
-                    .child(div().flex_1().min_h_0().child(body)),
+                    .justify_center()
+                    .px(px(CHAT_GUTTER))
+                    .child(
+                        div()
+                            .h_full()
+                            .w_full()
+                            .max_w(px(MAX_CONTENT_WIDTH))
+                            .min_w_0()
+                            .child(body),
+                    ),
             )
             .into_any_element()
     }
