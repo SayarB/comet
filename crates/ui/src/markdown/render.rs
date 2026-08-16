@@ -79,7 +79,14 @@ pub struct RenderOptions {
     /// Code-block copy-button plumbing (round 9): `None` renders no button
     /// (previews outside the transcript).
     pub copy: Option<CopyUi>,
+    /// Where a clicked link goes. `None` keeps the shared default —
+    /// `cx.open_url` — so surfaces that never open files are untouched; the
+    /// transcript supplies one to route workspace paths into the file viewer.
+    pub on_link: Option<LinkHandler>,
 }
+
+/// Handler for one clicked markdown link, receiving the raw (undecoded) target.
+pub type LinkHandler = Rc<dyn Fn(&str, &mut Window, &mut gpui::App)>;
 
 /// Copy-button wiring for one row's code blocks: the handler writes the code
 /// to the clipboard and flips a transient per-row "Copied" state owned by the
@@ -99,6 +106,7 @@ impl RenderOptions {
             cache: None,
             now: Instant::now(),
             copy: None,
+            on_link: None,
         }
     }
 }
@@ -663,10 +671,14 @@ fn flat_text_element(
     } else {
         let (ranges, urls): (Vec<_>, Vec<_>) = flat.links.iter().cloned().unzip();
         let id: SharedString = format!("{}-t{ix}", opts.row_key).into();
+        let on_link = opts.on_link.clone();
         InteractiveText::new(id, styled)
-            .on_click(ranges, move |clicked_ix, _window, cx| {
+            .on_click(ranges, move |clicked_ix, window, cx| {
                 if let Some(url) = urls.get(clicked_ix) {
-                    cx.open_url(url);
+                    match &on_link {
+                        Some(handler) => handler(url, window, cx),
+                        None => cx.open_url(url),
+                    }
                 }
             })
             .into_any_element()

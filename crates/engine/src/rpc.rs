@@ -57,7 +57,10 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
-use zeron_proto::{ChatConfig, EngineInfo, HarnessId, ToolCall, WorkspaceScope};
+use zeron_proto::{
+    ChatConfig, EngineInfo, HarnessId, ReadWorkspaceFileRequest, ToolCall,
+    WORKSPACE_FILE_PREVIEW_LIMIT, WorkspaceFileContent, WorkspaceFileRead, WorkspaceScope,
+};
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
 use crate::agent_accounts::AgentAccounts;
@@ -152,6 +155,293 @@ struct FileSearchParams {
     /// only after verifying it against the space repository's worktree list.
     #[serde(default)]
     path: Option<String>,
+}
+
+/// Lexically resolve `.` / `..` without touching the filesystem, so an
+/// escaping target is rejected before anything is opened. Popping past the
+/// root leaves a `..` component behind, which then fails the containment
+/// check instead of silently clamping to the root.
+fn normalize_lexical(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Path shown back to the client: checkout-relative when it resolved inside
+/// the root, otherwise the raw request (never an absolute host path).
+fn preview_display_path(
+    root: &std::path::Path,
+    target: &std::path::Path,
+    requested: &str,
+) -> String {
+    target
+        .strip_prefix(root)
+        .ok()
+        .map(|relative| relative.to_string_lossy().into_owned())
+        .filter(|relative| !relative.is_empty())
+        .unwrap_or_else(|| requested.to_string())
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+enum OpenWorkspaceTargetError {
+    OutsideWorkspace,
+    NotFound,
+    PermissionDenied,
+    Io(std::io::Error),
+}
+
+#[cfg(unix)]
+fn component_c_string(component: &std::ffi::OsStr) -> Result<std::ffi::CString, std::io::Error> {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::ffi::CString::new(component.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+}
+
+/// Open an absolute directory from `/`, one component at a time, without
+/// following links. The returned descriptor pins the checkout root for the
+/// rest of the read even if its pathname is concurrently renamed or replaced.
+#[cfg(unix)]
+fn open_directory_no_follow(path: &std::path::Path) -> Result<std::fs::File, std::io::Error> {
+    use std::os::fd::FromRawFd as _;
+
+    let root_fd = unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+        )
+    };
+    if root_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut directory = unsafe { std::fs::File::from_raw_fd(root_fd) };
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Normal(component) => {
+                directory = openat_no_follow(
+                    &directory,
+                    component,
+                    libc::O_RDONLY
+                        | libc::O_DIRECTORY
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC
+                        | libc::O_NONBLOCK,
+                )?;
+            }
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+            }
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn openat_no_follow(
+    parent: &std::fs::File,
+    component: &std::ffi::OsStr,
+    flags: libc::c_int,
+) -> Result<std::fs::File, std::io::Error> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let component = component_c_string(component)?;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), component.as_ptr(), flags) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn component_is_symlink(parent: &std::fs::File, component: &std::ffi::OsStr) -> bool {
+    use std::os::fd::AsRawFd as _;
+
+    let Ok(component) = component_c_string(component) else {
+        return false;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            component.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    result == 0 && unsafe { stat.assume_init().st_mode & libc::S_IFMT == libc::S_IFLNK }
+}
+
+#[cfg(unix)]
+fn classify_openat_error(
+    parent: &std::fs::File,
+    component: &std::ffi::OsStr,
+    error: std::io::Error,
+) -> OpenWorkspaceTargetError {
+    if component_is_symlink(parent, component) || error.raw_os_error() == Some(libc::ELOOP) {
+        OpenWorkspaceTargetError::OutsideWorkspace
+    } else {
+        match error.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+                OpenWorkspaceTargetError::NotFound
+            }
+            std::io::ErrorKind::PermissionDenied => OpenWorkspaceTargetError::PermissionDenied,
+            _ => OpenWorkspaceTargetError::Io(error),
+        }
+    }
+}
+
+/// Traverse from the already-open checkout descriptor with `openat` and
+/// `O_NOFOLLOW` on every component. Metadata and bytes are subsequently read
+/// from this exact descriptor, eliminating canonicalize-then-open TOCTOU.
+#[cfg(unix)]
+fn open_workspace_target(
+    mut directory: std::fs::File,
+    relative: &std::path::Path,
+) -> Result<std::fs::File, OpenWorkspaceTargetError> {
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(OpenWorkspaceTargetError::OutsideWorkspace);
+        };
+        let is_last = index + 1 == components.len();
+        let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        if !is_last {
+            flags |= libc::O_DIRECTORY;
+        }
+        directory = openat_no_follow(&directory, component, flags)
+            .map_err(|error| classify_openat_error(&directory, component, error))?;
+    }
+    Ok(directory)
+}
+
+/// NUL is always binary. For other valid UTF-8, reject control-heavy payloads
+/// while allowing ordinary tabs/newlines/carriage returns and the occasional
+/// non-printing character in otherwise readable text.
+fn previewable_utf8(bytes: Vec<u8>) -> Option<String> {
+    let text = String::from_utf8(bytes).ok()?;
+    if text.contains('\0') {
+        return None;
+    }
+    let mut chars = 0usize;
+    let mut controls = 0usize;
+    for ch in text.chars() {
+        chars += 1;
+        if ch.is_control() && !matches!(ch, '\t' | '\n' | '\r') {
+            controls += 1;
+        }
+    }
+    let control_heavy = controls > 2 && controls.saturating_mul(100) > chars.saturating_mul(5);
+    (!control_heavy).then_some(text)
+}
+
+/// Read one file for the viewer, contained inside `root`.
+///
+/// The root and target are opened descriptor-relative with `O_NOFOLLOW` on
+/// every component. Only regular, readable UTF-8 text at or under
+/// [`WORKSPACE_FILE_PREVIEW_LIMIT`] comes back — everything else is a typed
+/// state the viewer renders on purpose.
+fn read_workspace_file(
+    root: &std::path::Path,
+    requested: &str,
+) -> Result<WorkspaceFileRead, RpcError> {
+    use std::io::Read as _;
+
+    let requested = requested.trim();
+    let root = root
+        .canonicalize()
+        .map_err(|e| RpcError::Failed(format!("checkout root unavailable: {e}")))?;
+    let state =
+        |path: String, content: WorkspaceFileContent| Ok(WorkspaceFileRead { path, content });
+    if requested.is_empty() {
+        return state(String::new(), WorkspaceFileContent::NotFound);
+    }
+
+    let requested_path = std::path::Path::new(requested);
+    let joined = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        root.join(requested_path)
+    };
+    let lexical = normalize_lexical(&joined);
+    let display = preview_display_path(&root, &lexical, requested);
+    if !lexical.starts_with(&root) {
+        return state(display, WorkspaceFileContent::OutsideWorkspace);
+    }
+
+    let relative = lexical
+        .strip_prefix(&root)
+        .map_err(|_| RpcError::Failed("workspace path containment failed".into()))?;
+    #[cfg(unix)]
+    let file = match open_directory_no_follow(&root)
+        .map_err(OpenWorkspaceTargetError::Io)
+        .and_then(|directory| open_workspace_target(directory, relative))
+    {
+        Ok(file) => file,
+        Err(OpenWorkspaceTargetError::OutsideWorkspace) => {
+            return state(display, WorkspaceFileContent::OutsideWorkspace);
+        }
+        Err(OpenWorkspaceTargetError::NotFound) => {
+            return state(display, WorkspaceFileContent::NotFound);
+        }
+        Err(OpenWorkspaceTargetError::PermissionDenied) => {
+            return state(display, WorkspaceFileContent::PermissionDenied);
+        }
+        Err(OpenWorkspaceTargetError::Io(error)) => {
+            return Err(RpcError::Failed(format!("open workspace file: {error}")));
+        }
+    };
+    #[cfg(not(unix))]
+    return Err(RpcError::Failed(
+        "workspace file preview is unsupported on this platform".into(),
+    ));
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| RpcError::Failed(format!("inspect workspace file: {error}")))?;
+    if metadata.is_dir() {
+        return state(display, WorkspaceFileContent::Directory);
+    }
+    if !metadata.is_file() {
+        return state(display, WorkspaceFileContent::NotPreviewable);
+    }
+    let too_large = |byte_len: u64| WorkspaceFileContent::TooLarge {
+        byte_len,
+        limit: WORKSPACE_FILE_PREVIEW_LIMIT,
+    };
+    if metadata.len() > WORKSPACE_FILE_PREVIEW_LIMIT {
+        return state(display, too_large(metadata.len()));
+    }
+
+    // Read one byte past the cap: a file that grew since the stat is refused
+    // rather than served truncated.
+    let mut bytes = Vec::new();
+    file.take(WORKSPACE_FILE_PREVIEW_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| RpcError::Failed(format!("read workspace file: {error}")))?;
+    if bytes.len() as u64 > WORKSPACE_FILE_PREVIEW_LIMIT {
+        return state(display, too_large(bytes.len() as u64));
+    }
+    match previewable_utf8(bytes) {
+        Some(text) => state(display, WorkspaceFileContent::Text { text }),
+        None => state(display, WorkspaceFileContent::NotPreviewable),
+    }
 }
 
 fn tool_file_path(call: &ToolCall) -> Option<&str> {
@@ -464,6 +754,44 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("local import requires a synced workspace".into()))
     }
 
+    /// The chat's verified checkout root: its synced `cwd`, accepted only
+    /// after the space repository confirms the folder really is one of its
+    /// checkouts. Every path-scoped read for a chat (`SearchFiles`,
+    /// `ReadWorkspaceFile`) starts here, so a retargeted `cwd` can never widen
+    /// what a chat can reach.
+    async fn chat_checkout_root(&self, chat_id: &str) -> Result<std::path::PathBuf, RpcError> {
+        let local_device = self.doc_host.device_id();
+        let chat = self
+            .workspace
+            .chat(chat_id)
+            .map_err(|e| RpcError::Failed(e.to_string()))?
+            .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
+        if chat.device_id != local_device {
+            return Err(RpcError::Failed("chat belongs to another device".into()));
+        }
+        let cwd = chat
+            .cwd
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| RpcError::Failed("chat has no workspace folder".into()))?;
+        let space_id = chat
+            .space_id
+            .ok_or_else(|| RpcError::Failed("chat has no workspace space".into()))?;
+        let space = self
+            .workspace
+            .space(&space_id)
+            .map_err(|e| RpcError::Failed(e.to_string()))?
+            .ok_or_else(|| RpcError::Failed("chat workspace space not found".into()))?;
+        if space.device_id != local_device {
+            return Err(RpcError::Failed(
+                "chat space belongs to another device".into(),
+            ));
+        }
+        self.repos
+            .workspace_checkout(std::path::Path::new(&space.path), &cwd)
+            .await
+            .ok_or_else(|| RpcError::Failed("chat folder is not a workspace checkout".into()))
+    }
+
     /// Resolve a mention-search root from synced workspace rows. A client may
     /// name an existing linked worktree for a new chat, but it is verified
     /// against the space repository before any filesystem walk begins.
@@ -479,42 +807,7 @@ impl EngineRpc {
                         "SearchFiles path applies only to a space".into(),
                     ));
                 }
-                let chat = self
-                    .workspace
-                    .chat(chat_id)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
-                if chat.device_id != local_device {
-                    return Err(RpcError::Failed("chat belongs to another device".into()));
-                }
-                let cwd = chat
-                    .cwd
-                    .map(std::path::PathBuf::from)
-                    .ok_or_else(|| RpcError::Failed("chat has no workspace folder".into()))?;
-                let space_id = chat
-                    .space_id
-                    .ok_or_else(|| RpcError::Failed("chat has no workspace space".into()))?;
-                let space = self
-                    .workspace
-                    .space(&space_id)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .ok_or_else(|| RpcError::Failed("chat workspace space not found".into()))?;
-                if space.device_id != local_device {
-                    return Err(RpcError::Failed(
-                        "chat space belongs to another device".into(),
-                    ));
-                }
-                if let Some(cwd) = self
-                    .repos
-                    .workspace_checkout(std::path::Path::new(&space.path), &cwd)
-                    .await
-                {
-                    Ok(cwd)
-                } else {
-                    Err(RpcError::Failed(
-                        "chat folder is not a workspace checkout".into(),
-                    ))
-                }
+                self.chat_checkout_root(chat_id).await
             }
             (None, Some(space_id)) => {
                 let space = self
@@ -784,6 +1077,7 @@ fn forwardable(method: &str) -> bool {
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
             | methods::SEARCH_FILES
+            | methods::READ_WORKSPACE_FILE
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
             // Checkout diffs are produced on the device holding the checkout.
@@ -1543,6 +1837,14 @@ impl RpcService for EngineRpc {
                 .map_err(|_| RpcError::Failed("file search timed out".into()))??;
                 RpcReply::value(&matches)
             }
+            methods::READ_WORKSPACE_FILE => {
+                let p: ReadWorkspaceFileRequest = parse_params(params)?;
+                let root = self.chat_checkout_root(&p.chat_id).await?;
+                let read = tokio::task::spawn_blocking(move || read_workspace_file(&root, &p.path))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))??;
+                RpcReply::value(&read)
+            }
             methods::CREATE_WORKTREE => {
                 let p: CreateWorktreeParams = parse_params(params)?;
                 let worktree = self
@@ -1745,7 +2047,149 @@ mod tests {
         assert!(!forwardable(methods::ENGINE_READY));
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
+        // The viewer must read through the chat's HOST device, never the UI's
+        // own filesystem — so the method has to honor `targetDeviceId`.
+        assert!(forwardable(methods::READ_WORKSPACE_FILE));
         assert!(forwardable(methods::FETCH_ALL));
+    }
+
+    /// Every expected preview outcome, driven off one temporary checkout.
+    #[test]
+    fn workspace_file_preview_states_are_typed() {
+        let root = tempfile::tempdir().expect("checkout root");
+        let root_path = root.path();
+        std::fs::create_dir(root_path.join("docs")).expect("docs dir");
+        std::fs::write(root_path.join("docs/plan.md"), "# Plan\n- one\n").expect("plan fixture");
+        std::fs::write(root_path.join("logo.png"), [0xffu8, 0xd8, 0xff, 0x00]).expect("binary");
+        std::fs::write(root_path.join("nul.txt"), b"valid utf-8\0binary").expect("nul binary");
+        std::fs::write(
+            root_path.join("controls.txt"),
+            format!("header{}", "\u{0001}".repeat(32)),
+        )
+        .expect("control-heavy binary");
+        std::fs::write(
+            root_path.join("occasional-control.txt"),
+            format!("{}{}", "readable ".repeat(200), "\u{0001}"),
+        )
+        .expect("mostly-readable text");
+        std::fs::write(
+            root_path.join("huge.md"),
+            "x".repeat(WORKSPACE_FILE_PREVIEW_LIMIT as usize + 1),
+        )
+        .expect("oversized");
+        let outside_dir = tempfile::tempdir().expect("outside dir");
+        let outside = outside_dir.path().join("outside.md");
+        std::fs::write(&outside, "secret\n").expect("outside fixture");
+
+        let read = |requested: &str| read_workspace_file(root_path, requested).expect("read");
+        let text = |requested: &str| match read(requested).content {
+            WorkspaceFileContent::Text { text } => text,
+            other => panic!("{requested}: expected text, got {other:?}"),
+        };
+        let content = |requested: &str| read(requested).content;
+
+        // Relative and canonical-absolute forms of the same file both work,
+        // and both report the checkout-relative path.
+        assert_eq!(text("docs/plan.md"), "# Plan\n- one\n");
+        assert_eq!(text("./docs/plan.md"), "# Plan\n- one\n");
+        let absolute = root_path
+            .canonicalize()
+            .expect("canonical root")
+            .join("docs/plan.md");
+        assert_eq!(text(&absolute.to_string_lossy()), "# Plan\n- one\n");
+        assert_eq!(read("docs/plan.md").path, "docs/plan.md");
+
+        assert_eq!(content("docs/missing.md"), WorkspaceFileContent::NotFound);
+        assert_eq!(content("docs"), WorkspaceFileContent::Directory);
+        assert_eq!(content("logo.png"), WorkspaceFileContent::NotPreviewable);
+        assert_eq!(
+            content("nul.txt"),
+            WorkspaceFileContent::NotPreviewable,
+            "valid UTF-8 containing NUL is binary"
+        );
+        assert_eq!(
+            content("controls.txt"),
+            WorkspaceFileContent::NotPreviewable,
+            "control-heavy valid UTF-8 is binary"
+        );
+        assert!(
+            matches!(
+                content("occasional-control.txt"),
+                WorkspaceFileContent::Text { .. }
+            ),
+            "an occasional control character does not hide readable text"
+        );
+        assert_eq!(
+            content("huge.md"),
+            WorkspaceFileContent::TooLarge {
+                byte_len: WORKSPACE_FILE_PREVIEW_LIMIT + 1,
+                limit: WORKSPACE_FILE_PREVIEW_LIMIT,
+            },
+            "oversized files are refused, never truncated"
+        );
+
+        // `..`, an absolute path elsewhere on the host, and a symlink out of
+        // the checkout are all the same answer: nothing crosses the root.
+        assert_eq!(
+            content("../outside.md"),
+            WorkspaceFileContent::OutsideWorkspace
+        );
+        assert_eq!(
+            content("docs/../../outside.md"),
+            WorkspaceFileContent::OutsideWorkspace
+        );
+        assert_eq!(
+            content(&outside.to_string_lossy()),
+            WorkspaceFileContent::OutsideWorkspace
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root_path.join("escape.md")).expect("symlink");
+            assert_eq!(
+                content("escape.md"),
+                WorkspaceFileContent::OutsideWorkspace,
+                "a symlink inside the checkout must not expose its target"
+            );
+            std::os::unix::fs::symlink(root_path.join("docs"), root_path.join("linked-docs"))
+                .expect("internal directory symlink");
+            assert_eq!(
+                content("linked-docs/plan.md"),
+                WorkspaceFileContent::OutsideWorkspace,
+                "descriptor traversal never follows intermediate symlinks"
+            );
+        }
+    }
+
+    /// The file descriptor returned by the no-follow walk is the descriptor
+    /// read by the RPC. Replacing its pathname with an outside symlink after
+    /// open cannot redirect the already-verified read.
+    #[cfg(unix)]
+    #[test]
+    fn workspace_file_descriptor_survives_path_swap() {
+        use std::io::Read as _;
+
+        let root = tempfile::tempdir().expect("checkout root");
+        let victim = root.path().join("victim.txt");
+        let moved = root.path().join("opened.txt");
+        let outside_dir = tempfile::tempdir().expect("outside dir");
+        let outside = outside_dir.path().join("secret.txt");
+        std::fs::write(&victim, "inside").expect("inside fixture");
+        std::fs::write(&outside, "outside secret").expect("outside fixture");
+
+        let canonical_root = root.path().canonicalize().expect("canonical root");
+        let directory = open_directory_no_follow(&canonical_root).expect("open root descriptor");
+        let mut opened = open_workspace_target(directory, std::path::Path::new("victim.txt"))
+            .expect("open file");
+
+        std::fs::rename(&victim, &moved).expect("move opened file");
+        std::os::unix::fs::symlink(&outside, &victim).expect("swap pathname to outside symlink");
+
+        let mut text = String::new();
+        opened
+            .read_to_string(&mut text)
+            .expect("read pinned descriptor");
+        assert_eq!(text, "inside");
+        assert_ne!(text, "outside secret");
     }
 
     #[test]

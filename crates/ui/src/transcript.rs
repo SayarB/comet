@@ -1454,6 +1454,16 @@ pub struct Transcript {
     _observe: Subscription,
 }
 
+/// What the transcript asks the shell to do on its behalf.
+pub enum TranscriptEvent {
+    /// A workspace file link was clicked — open (or replace) the file viewer.
+    /// The path is already classified and decoded
+    /// ([`crate::file_viewer::classify_link`]); external URLs never get here.
+    OpenWorkspaceFile(String),
+}
+
+impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
+
 /// One sidecar blob fetch's lifecycle.
 enum BlobFetch {
     Loading(#[allow(dead_code)] Task<()>),
@@ -2790,6 +2800,7 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    on_link: Some(self.link_ui(cx)),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -2832,6 +2843,7 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    on_link: Some(self.link_ui(cx)),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -2964,6 +2976,25 @@ impl Transcript {
                     .children(trailer),
             )
             .into_any_element()
+    }
+
+    /// Link dispatch for rendered markdown: workspace paths become an
+    /// [`TranscriptEvent::OpenWorkspaceFile`] for the shell's file viewer,
+    /// everything else keeps the platform's open-url behavior.
+    fn link_ui(&self, cx: &mut Context<Self>) -> render::LinkHandler {
+        let entity = cx.weak_entity();
+        Rc::new(move |target: &str, _window, cx: &mut gpui::App| {
+            match crate::file_viewer::classify_link(target) {
+                crate::file_viewer::LinkTarget::WorkspacePath(path) => {
+                    entity
+                        .update(cx, |_, cx| {
+                            cx.emit(TranscriptEvent::OpenWorkspaceFile(path))
+                        })
+                        .ok();
+                }
+                crate::file_viewer::LinkTarget::External => cx.open_url(target),
+            }
+        })
     }
 
     /// Copy-button wiring for one row's code blocks ([`render::CopyUi`]):
