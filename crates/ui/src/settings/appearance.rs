@@ -233,17 +233,15 @@ impl Render for AppearancePage {
                                                 .flex_col()
                                                 .child(widgets::row_title(
                                                     &theme,
-                                                    "Editorial serif",
+                                                    "Tufte in file viewer",
                                                 ))
                                                 .child(widgets::meta_line(
                                                     &theme,
                                                     vec![div()
                                                         .child(SharedString::from(
-                                                            "Use a reading serif for replies and \
-                                                             the file viewer — the same register \
-                                                             Cursor and other agent UIs use. \
-                                                             Chrome, the composer, and code \
-                                                             stay on Geist.",
+                                                            "Serif type, centered headings, and \
+                                                             a reading column for opened files \
+                                                             only. Agent replies stay on Geist.",
                                                         ))
                                                         .into_any_element()],
                                                 )),

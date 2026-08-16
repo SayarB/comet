@@ -94,8 +94,8 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
-    /// Paint markdown body (replies, file viewer) in the editorial serif
-    /// rather than Geist. Off by default; UI chrome and code stay sans/mono.
+    /// Paint opened files in a Tufte reading layout (serif, centered
+    /// headings). Chat markdown never reads this flag.
     pub markdown_serif: bool,
 }
 
@@ -119,7 +119,7 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
-            markdown_serif: false,
+            markdown_serif: true,
         }
     }
 }
@@ -411,8 +411,8 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
         assert!(
-            !loaded.markdown_serif,
-            "pre-serif files default to Geist markdown"
+            loaded.markdown_serif,
+            "pre-tufte files default to Tufte in the file viewer"
         );
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");

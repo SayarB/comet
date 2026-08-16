@@ -144,7 +144,6 @@ pub fn set_markdown_serif(on: bool, cx: &mut App) {
     if cx.has_global::<Theme>() {
         cx.global_mut::<Theme>().markdown_serif = on;
     }
-    crate::theme::bump_theme_generation();
     persist_markdown_serif(on, &data_dir);
     cx.refresh_windows();
 }

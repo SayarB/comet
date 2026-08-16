@@ -493,6 +493,7 @@ impl FileViewer {
             ViewerBody::Markdown(tree) => {
                 let entity = cx.weak_entity();
                 let opts = RenderOptions {
+                    tufte: crate::appearance::markdown_serif(cx),
                     on_link: Some(Rc::new(move |target: &str, _window, cx| {
                         let target = target.to_string();
                         entity

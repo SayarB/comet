@@ -31,6 +31,9 @@ pub const MD_BLOCK_GAP: f32 = 12.0;
 /// Body text size / line height (zeron: 14px / 22px).
 pub const MD_TEXT_SIZE: f32 = 14.0;
 pub const MD_LINE_HEIGHT: f32 = 22.0;
+/// Tufte file-viewer body: a hair larger, more open — files only.
+const TUFTE_TEXT_SIZE: f32 = 16.0;
+const TUFTE_LINE_HEIGHT: f32 = 26.0;
 /// Code block metrics — height is `lines × CODE_LINE_HEIGHT + padding + header`.
 pub const CODE_TEXT_SIZE: f32 = 12.5;
 pub const CODE_LINE_HEIGHT: f32 = 18.0;
@@ -81,8 +84,12 @@ pub struct RenderOptions {
     pub copy: Option<CopyUi>,
     /// Where a clicked link goes. `None` keeps the shared default —
     /// `cx.open_url` — so surfaces that never open files are untouched; the
-    /// transcript supplies one to route workspace paths into the file viewer.
+    /// Transcript supplies one to route workspace paths into the file viewer.
     pub on_link: Option<LinkHandler>,
+    /// Tufte reading layout: editorial serif, centered headings, slightly
+    /// looser body type. The file viewer is the only caller; chat never
+    /// sets this, so replies stay on Geist.
+    pub tufte: bool,
 }
 
 /// Handler for one clicked markdown link, receiving the raw (undecoded) target.
@@ -107,6 +114,7 @@ impl RenderOptions {
             now: Instant::now(),
             copy: None,
             on_link: None,
+            tufte: false,
         }
     }
 }
@@ -211,20 +219,21 @@ pub fn render_block(
     highlight: CodeHighlight,
 ) -> AnyElement {
     match block {
-        Block::Paragraph { runs } => text_element(
-            runs,
-            MD_TEXT_SIZE,
-            MD_LINE_HEIGHT,
-            false,
-            false,
-            top_ix,
-            ix,
-            opts,
-            theme,
-        ),
+        Block::Paragraph { runs } => {
+            let (size, line) = if opts.tufte {
+                (TUFTE_TEXT_SIZE, TUFTE_LINE_HEIGHT)
+            } else {
+                (MD_TEXT_SIZE, MD_LINE_HEIGHT)
+            };
+            text_element(runs, size, line, false, false, top_ix, ix, opts, theme)
+        }
         Block::Heading { level, runs } => {
-            let (size, line) = heading_metrics(*level);
-            text_element(runs, size, line, true, true, top_ix, ix, opts, theme)
+            let (size, line) = if opts.tufte {
+                tufte_heading_metrics(*level)
+            } else {
+                heading_metrics(*level)
+            };
+            text_element(runs, size, line, true, opts.tufte, top_ix, ix, opts, theme)
         }
         Block::CodeBlock { language, code } => render_code_block(
             language.as_deref(),
@@ -333,6 +342,15 @@ fn heading_metrics(level: u8) -> (f32, f32) {
         2 => (16.0, 24.0),
         3 => (15.0, 22.0),
         _ => (14.0, 22.0),
+    }
+}
+
+fn tufte_heading_metrics(level: u8) -> (f32, f32) {
+    match level {
+        1 => (28.0, 36.0),
+        2 => (20.0, 28.0),
+        3 => (16.0, 24.0),
+        _ => (15.0, 24.0),
     }
 }
 
@@ -533,12 +551,18 @@ pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, bold_default: bool) -> Fl
         } else {
             FontWeight::NORMAL
         },
+        false,
     )
 }
 
 /// [`flatten_runs`] with an explicit base weight (table headers are 700 per
 /// zeron's `table.headerWeight`; strong runs never drop below semibold).
-fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWeight) -> FlatText {
+fn flatten_runs_weighted(
+    runs: &[InlineRun],
+    theme: &Theme,
+    base_weight: FontWeight,
+    serif: bool,
+) -> FlatText {
     let mut text = String::new();
     let mut out: Vec<TextRun> = Vec::with_capacity(runs.len());
     let mut links: Vec<(Range<usize>, String)> = Vec::new();
@@ -551,8 +575,10 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         text.push_str(&run.text);
         let mut f = if run.style.code {
             font(theme.font_mono.clone())
+        } else if serif {
+            font(theme.font_serif.clone())
         } else {
-            font(theme.md_body_font())
+            font(theme.font_sans.clone())
         };
         f.weight = if run.style.bold && base_weight.0 < FontWeight::SEMIBOLD.0 {
             FontWeight::SEMIBOLD
@@ -641,10 +667,12 @@ fn flatten_cached(
             cache
                 .flats
                 .entry((opts.row_key.clone(), top_ix, ix))
-                .or_insert_with(|| Rc::new(flatten_runs_weighted(runs, theme, base_weight)))
+                .or_insert_with(|| {
+                    Rc::new(flatten_runs_weighted(runs, theme, base_weight, opts.tufte))
+                })
                 .clone()
         }
-        None => Rc::new(flatten_runs_weighted(runs, theme, base_weight)),
+        None => Rc::new(flatten_runs_weighted(runs, theme, base_weight, opts.tufte)),
     }
 }
 
@@ -1384,7 +1412,7 @@ mod tests {
             text: "Header".into(),
             style: InlineStyle::default(),
         }];
-        let flat = flatten_runs_weighted(&runs, &theme, TABLE_HEADER_WEIGHT);
+        let flat = flatten_runs_weighted(&runs, &theme, TABLE_HEADER_WEIGHT, false);
         assert_eq!(flat.runs[0].font.weight, FontWeight::BOLD);
         // Strong runs inside a 700 header stay 700 (never drop to semibold).
         let bold_runs = vec![InlineRun {
@@ -1394,7 +1422,7 @@ mod tests {
                 ..Default::default()
             },
         }];
-        let flat = flatten_runs_weighted(&bold_runs, &theme, TABLE_HEADER_WEIGHT);
+        let flat = flatten_runs_weighted(&bold_runs, &theme, TABLE_HEADER_WEIGHT, false);
         assert_eq!(flat.runs[0].font.weight, FontWeight::BOLD);
     }
 
