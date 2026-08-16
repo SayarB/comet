@@ -957,11 +957,17 @@ impl Shell {
         // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
+            let file_viewer = file_viewer.clone();
             move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
                 ComposerEvent::Sent {
                     chat_id,
                     message_id,
                 } => {
+                    // Sending is a return to the conversation: the prompt (and
+                    // the reply it reserves space for) is what the user now
+                    // wants to watch, so a file left open from reading gets out
+                    // of the way instead of hiding its own send.
+                    file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
                     transcript.update(cx, |t, cx| {
                         t.on_own_send(chat_id.clone(), message_id.clone(), cx)
                     });
