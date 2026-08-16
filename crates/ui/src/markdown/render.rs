@@ -90,6 +90,13 @@ pub struct RenderOptions {
     /// looser body type. The file viewer is the only caller; chat never
     /// sets this, so replies stay on Geist.
     pub tufte: bool,
+    /// Select fenced-code lines with the markdown selection machinery. Chat
+    /// leaves this off (the copy button already covers a whole block); the
+    /// file viewer turns it on so a drag across a fence copies the source.
+    pub select_code: bool,
+    /// Extra horizontal hit padding (px) around each text row so a drag that
+    /// starts in the column gutter still anchors. Chat leaves this 0.
+    pub select_pad_x: f32,
 }
 
 /// Handler for one clicked markdown link, receiving the raw (undecoded) target.
@@ -115,6 +122,8 @@ impl RenderOptions {
             copy: None,
             on_link: None,
             tufte: false,
+            select_code: false,
+            select_pad_x: 0.0,
         }
     }
 }
@@ -497,6 +506,7 @@ fn render_table(
                     table_cell_ix(ix, r, c),
                     opts,
                     theme,
+                    false,
                 ));
             }
             row_el = row_el.child(cell);
@@ -682,6 +692,7 @@ fn flat_text_element(
     ix: usize,
     opts: &RenderOptions,
     theme: &Theme,
+    centered: bool,
 ) -> AnyElement {
     // Streaming veil: opacity-only recolor of the runs covering newly appended
     // chunks. Same text, same fonts, same lengths — layout is untouched.
@@ -722,9 +733,10 @@ fn flat_text_element(
     let flat_text = flat.text.clone();
     let wash = inline_code_wash(theme);
     let sel_wash = selection_wash(theme);
+    let pad_x = opts.select_pad_x;
     let underlay = canvas(
         |_, _, _| (),
-        move |_, _, window, _| {
+        move |bounds, _, window, _| {
             for range in &code_ranges {
                 for rect in range_rects(&layout, range, INLINE_CODE_PAD_X, INLINE_CODE_INSET_Y) {
                     window.paint_quad(quad(
@@ -749,23 +761,38 @@ fn flat_text_element(
                     ));
                 }
             }
-            // Register this element into the frame's document-ordered
-            // registry (paint order IS document order), then the frame's
-            // mouse listeners.
+            let hit = inflate_hit(bounds, pad_x);
             REGISTRY.with(|r| {
                 r.borrow_mut().push(RegEntry {
                     key: sel_key.clone(),
                     text: flat_text.clone(),
                     layout: layout.clone(),
+                    hit,
                 })
             });
-            register_selection_listeners(window, &sel_key, &flat_text, &layout);
+            register_selection_listeners(window, &sel_key, &flat_text, &layout, hit);
         },
     )
     .absolute()
     .size_full();
+    // Full-width row so the canvas covers the column (gutters included via
+    // `select_pad_x`). Centered headings are a FLEX-centered shrink-wrap
+    // rather than inherited `text_align: center` — gpui paints centered
+    // glyphs but `position_for_index` does not, which offset the selection
+    // wash from the letters.
+    let text_el = if centered {
+        div()
+            .flex()
+            .justify_center()
+            .w_full()
+            .child(text_el)
+            .into_any_element()
+    } else {
+        text_el
+    };
     div()
         .relative()
+        .w_full()
         .child(underlay)
         .child(text_el)
         .into_any_element()
@@ -781,15 +808,27 @@ fn selection_wash(theme: &Theme) -> Hsla {
 /// into the frame's document-ordered registry (so drags span into adjacent
 /// markdown rows and Cmd+C joins in order), and re-registers the mouse
 /// listeners. Call from a paint-phase canvas that sits UNDER the text.
+///
+/// `fit_row` pins every wash box to `hit`'s vertical band. Editor / fence
+/// lines are one visual row: the canvas *is* the line box, but glyph
+/// `position_for_index` Y can stride against that row (an error that grows
+/// down the file). Wrapped bubbles must leave this off so wrap rows keep
+/// their own Y.
 pub(crate) fn paint_text_selection(
     window: &mut Window,
     key: &std::sync::Arc<str>,
     text: &SharedString,
     layout: &gpui::TextLayout,
     theme: &Theme,
+    hit: Bounds<gpui::Pixels>,
+    fit_row: bool,
 ) {
     if let Some(range) = super::selection::wash_range(key) {
-        for rect in range_rects(layout, &range, 0.0, 0.0) {
+        for mut rect in range_rects(layout, &range, 0.0, 0.0) {
+            if fit_row {
+                rect.origin.y = hit.origin.y;
+                rect.size.height = hit.size.height;
+            }
             window.paint_quad(quad(
                 rect,
                 px(0.0),
@@ -805,9 +844,38 @@ pub(crate) fn paint_text_selection(
             key: key.clone(),
             text: text.clone(),
             layout: layout.clone(),
+            hit,
         })
     });
-    register_selection_listeners(window, key, text, layout);
+    register_selection_listeners(window, key, text, layout, hit);
+}
+
+/// Styled text with the selection underlay: wash, registry, mouse listeners.
+/// Same recipe as a markdown paragraph / the user bubble.
+pub(crate) fn selectable_styled_text(
+    key: std::sync::Arc<str>,
+    styled: StyledText,
+    text: SharedString,
+    theme: &Theme,
+) -> AnyElement {
+    let layout = styled.layout().clone();
+    let sel_theme = theme.clone();
+    let underlay = canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            paint_text_selection(window, &key, &text, &layout, &sel_theme, bounds, true);
+        },
+    )
+    .absolute()
+    .size_full();
+    div()
+        .relative()
+        .w_full()
+        .h_full()
+        .cursor(gpui::CursorStyle::IBeam)
+        .child(underlay)
+        .child(styled)
+        .into_any_element()
 }
 
 /// One painted text element, registered per frame in document order — the
@@ -817,6 +885,8 @@ struct RegEntry {
     key: std::sync::Arc<str>,
     text: SharedString,
     layout: gpui::TextLayout,
+    /// Full-row hit box (often wider than the glyphs — includes gutters).
+    hit: Bounds<gpui::Pixels>,
 }
 
 thread_local! {
@@ -825,7 +895,9 @@ thread_local! {
 
 /// A zero-size canvas that clears the selection registry — paint it FIRST in
 /// the transcript root (before any markdown), so each frame's registry holds
-/// exactly that frame's visible text elements in paint order.
+/// exactly that frame's visible text elements in paint order. The file viewer
+/// paints the same reset when it overlays the transcript: without it, hidden
+/// chat rows keep occupying the registry's window bounds and steal the drag.
 pub fn selection_frame_reset() -> impl IntoElement {
     canvas(
         |_, _, _| (),
@@ -844,7 +916,7 @@ fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)>
         let reg = r.borrow();
         let mut best: Option<(usize, f32)> = None;
         for (ei, entry) in reg.iter().enumerate() {
-            let b = entry.layout.bounds();
+            let b = entry.hit;
             let dy = if position.y < b.top() {
                 f32::from(b.top() - position.y)
             } else if position.y > b.bottom() {
@@ -884,6 +956,16 @@ fn resolve_drag(anchor_key: &str, anchor_ix: usize, head: (usize, usize)) -> boo
     })
 }
 
+fn inflate_hit(bounds: Bounds<gpui::Pixels>, pad_x: f32) -> Bounds<gpui::Pixels> {
+    if pad_x <= 0.0 {
+        return bounds;
+    }
+    let mut hit = bounds;
+    hit.origin.x -= px(pad_x);
+    hit.size.width += px(pad_x * 2.0);
+    hit
+}
+
 /// Register this frame's window-level mouse listeners for one text element's
 /// selection (Zed-markdown mechanics: window-level so a drag keeps tracking
 /// outside the element's bounds; frame-scoped, so paint re-registers).
@@ -892,15 +974,18 @@ fn register_selection_listeners(
     key: &std::sync::Arc<str>,
     text: &SharedString,
     layout: &gpui::TextLayout,
+    hit: Bounds<gpui::Pixels>,
 ) {
     use gpui::{DispatchPhase, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
     {
-        let (key, text, layout) = (key.clone(), text.clone(), layout.clone());
+        let (key, text, layout, hit) = (key.clone(), text.clone(), layout.clone(), hit);
         window.on_mouse_event(move |e: &MouseDownEvent, phase, window, _cx| {
             if phase != DispatchPhase::Bubble || e.button != MouseButton::Left {
                 return;
             }
-            if layout.bounds().contains(&e.position) {
+            // Hit the whole row (plus gutter pad), not just the glyph box —
+            // a drag that starts in the margin still anchors, like an editor.
+            if hit.contains(&e.position) {
                 let ix = match layout.index_for_position(e.position) {
                     Ok(ix) | Err(ix) => ix,
                 };
@@ -958,6 +1043,11 @@ fn register_selection_listeners(
 /// text's own geometry. `pad_x` overhangs the box horizontally (inline code);
 /// `inset_y` shrinks it vertically — both 0 for a selection wash, which wants
 /// full-line-height boxes that tile seamlessly across wrapped rows.
+///
+/// Walks GPUI's wrap boundaries the same way glyph paint does (`n ×
+/// line_height`) instead of binary-searching `position_for_index` Y. That
+/// search treated "same row" as exact float equality, so a sub-pixel stride
+/// split one wrap into many boxes whose Y drifted from the glyphs.
 pub(crate) fn range_rects(
     layout: &gpui::TextLayout,
     range: &Range<usize>,
@@ -965,50 +1055,53 @@ pub(crate) fn range_rects(
     inset_y: f32,
 ) -> Vec<Bounds<gpui::Pixels>> {
     let mut rects = Vec::new();
+    if range.start >= range.end {
+        return rects;
+    }
+    let origin = layout.bounds().origin;
     let line_height = layout.line_height();
-    let mut cur = range.start;
-    // Walk the range one visual row at a time: find the furthest index that
-    // still sits on the current row (binary search over glyph positions).
-    let mut guard = 0;
-    while cur < range.end && guard < 256 {
-        guard += 1;
-        let Some(p1) = layout.position_for_index(cur) else {
-            break;
-        };
-        // `seg_end` closes the wash on this row; `next` is the first index on
-        // the following row (strict progress even though a row-end index's
-        // position still reports the earlier row).
-        let (seg_end, next) = match layout.position_for_index(range.end) {
-            Some(pe) if pe.y == p1.y => (range.end, range.end),
-            _ => {
-                // Largest ix on this row (probes stay on char boundaries only
-                // at the ends; intermediate probes just need a y).
-                let (mut lo, mut hi) = (cur, range.end);
-                while hi - lo > 1 {
-                    let mid = lo + (hi - lo) / 2;
-                    match layout.position_for_index(mid) {
-                        Some(pm) if pm.y == p1.y => lo = mid,
-                        _ => hi = mid,
+    let mut byte_at = 0usize;
+    let mut y = origin.y;
+    for wrapped in layout.line_layouts() {
+        let line_len = wrapped.len();
+        let row_ends = wrapped
+            .wrap_boundaries()
+            .iter()
+            .map(|boundary| wrapped.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+            .chain(std::iter::once(line_len));
+        let mut row_start_local = 0usize;
+        for (row_ix, row_end_local) in row_ends.enumerate() {
+            let global_start = byte_at + row_start_local;
+            let global_end = byte_at + row_end_local;
+            let start = range.start.max(global_start);
+            let end = range.end.min(global_end);
+            if start < end {
+                let row_y = y + line_height * row_ix;
+                let start_x = if start == global_start {
+                    origin.x
+                } else {
+                    wrapped
+                        .position_for_index(start - byte_at, line_height)
+                        .map(|p| origin.x + p.x)
+                        .unwrap_or(origin.x)
+                };
+                if let Some(end_p) = wrapped.position_for_index(end - byte_at, line_height) {
+                    let end_x = origin.x + end_p.x;
+                    if end_x > start_x {
+                        rects.push(Bounds::new(
+                            point(start_x - px(pad_x), row_y + px(inset_y)),
+                            size(
+                                end_x - start_x + px(2.0 * pad_x),
+                                line_height - px(2.0 * inset_y),
+                            ),
+                        ));
                     }
                 }
-                (lo, hi)
             }
-        };
-        if let Some(p2) = layout.position_for_index(seg_end)
-            && p2.x > p1.x
-        {
-            rects.push(Bounds::new(
-                point(p1.x - px(pad_x), p1.y + px(inset_y)),
-                size(
-                    p2.x - p1.x + px(2.0 * pad_x),
-                    line_height - px(2.0 * inset_y),
-                ),
-            ));
+            row_start_local = row_end_local;
         }
-        if next <= cur {
-            break;
-        }
-        cur = next;
+        y += wrapped.size(line_height).height;
+        byte_at = byte_at + line_len + 1;
     }
     rects
 }
@@ -1031,12 +1124,11 @@ fn text_element(
         FontWeight::NORMAL
     };
     let flat = flatten_cached(runs, weight, top_ix, ix, opts, theme);
-    let inner = flat_text_element(&flat, ix, opts, theme);
+    let inner = flat_text_element(&flat, ix, opts, theme, centered);
     div()
         .w_full()
         .text_size(px(size))
         .line_height(px(line_height))
-        .when(centered, |el| el.text_center())
         .child(inner)
         .into_any_element()
 }
@@ -1178,19 +1270,27 @@ fn render_code_block(
                 .whitespace_nowrap()
                 .flex()
                 .flex_col()
-                .children((0..cached.lines.len()).scan(0usize, move |off, li| {
-                    let (line, runs) = &cached.lines[li];
-                    let start = *off;
-                    *off = start + line.len() + 1; // +1 for the '\n'
-                    let local = slice_spans(&veil_spans, start, start + line.len());
-                    let runs = apply_veil(runs.clone(), &local);
-                    Some(
-                        div()
-                            .h(px(CODE_LINE_HEIGHT))
-                            .flex_none()
-                            .child(StyledText::new(line.clone()).with_runs(runs)),
-                    )
-                })),
+                .children({
+                    let row_key = opts.row_key.clone();
+                    let theme = theme.clone();
+                    let select_code = opts.select_code;
+                    (0..cached.lines.len()).scan(0usize, move |off, li| {
+                        let (line, runs) = &cached.lines[li];
+                        let start = *off;
+                        *off = start + line.len() + 1; // +1 for the '\n'
+                        let local = slice_spans(&veil_spans, start, start + line.len());
+                        let runs = apply_veil(runs.clone(), &local);
+                        let styled = StyledText::new(line.clone()).with_runs(runs);
+                        let inner = if select_code && !line.is_empty() {
+                            let key: std::sync::Arc<str> =
+                                format!("{}:code{ix}:{li}", row_key).into();
+                            selectable_styled_text(key, styled, line.clone(), &theme)
+                        } else {
+                            styled.into_any_element()
+                        };
+                        Some(div().h(px(CODE_LINE_HEIGHT)).flex_none().child(inner))
+                    })
+                }),
         )
         // Overlay LAST so it paints above the header/body.
         .children(copy_button)

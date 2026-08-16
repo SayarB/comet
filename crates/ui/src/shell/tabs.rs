@@ -31,8 +31,16 @@ impl Shell {
     /// Open a session from the sidebar: select it, the main area follows.
     pub(super) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.route = Route::Chat;
+        let switching = self.state.read(cx).selected_chat.as_deref() != Some(chat_id.as_str());
         self.state
             .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
+        // A preview belongs to the session that opened it. Close it here —
+        // not only from the AppState observer — because this click is already
+        // a Shell update, and gpui may not re-enter that observer until a
+        // later notify (so the overlay would sit on the new transcript).
+        if switching {
+            self.file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
+        }
         cx.notify();
     }
 
@@ -55,6 +63,7 @@ impl Shell {
             }
             s.select_chat(None, cx);
         });
+        self.file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
         cx.notify();
     }
 

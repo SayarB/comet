@@ -1856,6 +1856,7 @@ impl Shell {
                 let target = (!chat_id.is_empty()).then_some(chat_id);
                 if self.state.read(cx).selected_chat != target {
                     self.state.update(cx, |s, cx| s.select_chat(target, cx));
+                    self.file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
                 }
             }
             NavEntry::Settings(section) => {
@@ -2060,6 +2061,7 @@ impl Shell {
         self.delete_confirm = None;
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
+            self.file_viewer.update(cx, |viewer, cx| viewer.clear(cx));
         }
         self.composer
             .update(cx, |composer, _| composer.purge_chat(&chat_id));

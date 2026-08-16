@@ -7,19 +7,21 @@
 //! a local one behaves identically.
 //!
 //! The viewer is deliberately small: one file at a time, no editing, no tabs.
-//! Markdown renders through the transcript's own parser/renderer; other UTF-8
-//! text renders as scrollable monospace; every refusal the host can express
-//! (missing, outside the checkout, directory, binary, oversized) gets its own
-//! deliberate state rather than a blank pane.
+//! Markdown renders through the transcript's own parser/renderer as a reading
+//! preview; other UTF-8 text opens as a read-only editor (line numbers, syntax,
+//! virtualized rows) without a caret or edits. Every refusal the host can
+//! express (missing, outside the checkout, directory, binary, oversized) gets
+//! its own deliberate state rather than a blank pane.
 
 use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, ScrollHandle, SharedString, Task, Window, div,
-    prelude::*, px,
+    AnyElement, Context, CursorStyle, Entity, EventEmitter, ListAlignment, ListState, ScrollHandle,
+    SharedString, StyledText, Task, Window, div, font, list, prelude::*, px,
 };
 use zeron_proto::{WorkspaceFileContent, WorkspaceFileRead};
 use zeron_rpc::{RpcError, methods};
+use zeron_syntax::{HighlightRequest, LanguageId};
 
 use crate::composer::{FILE_MENTION_SCHEME, percent_decode_path};
 use crate::icons::{self, icon};
@@ -31,6 +33,9 @@ use crate::transcript::MAX_CONTENT_WIDTH;
 
 /// Horizontal gutter matching the transcript (`px-4 @3xl:px-12` → 48px).
 const CHAT_GUTTER: f32 = 48.0;
+/// Editor row metrics — same density as the checkout-diff line grid.
+const EDITOR_LINE_HEIGHT: f32 = 21.0;
+const EDITOR_GUTTER_MIN: f32 = 44.0;
 
 // ---------------------------------------------------------------------------
 // Link classification (shared by the transcript and the viewer itself)
@@ -281,6 +286,18 @@ pub struct FileViewer {
     /// content is padded and faded across it, so a line is never parked
     /// unreadably under the composer while still scrolling past it.
     chrome_inset: Cell<f32>,
+    /// Virtualized source buffer (non-markdown). `None` while loading,
+    /// previewing markdown, or showing a notice.
+    editor: Option<EditorBuffer>,
+    list: ListState,
+    highlight_task: Option<Task<()>>,
+}
+
+/// One opened source file, split into editor rows.
+struct EditorBuffer {
+    request: u64,
+    lines: Arc<Vec<SharedString>>,
+    highlight: Option<Arc<zeron_syntax::HighlightedDocument>>,
 }
 
 impl EventEmitter<FileViewerEvent> for FileViewer {}
@@ -294,6 +311,9 @@ impl FileViewer {
             scroll: ScrollHandle::new(),
             task: None,
             chrome_inset: Cell::new(0.0),
+            editor: None,
+            list: ListState::new(0, ListAlignment::Top, px(512.0)),
+            highlight_task: None,
         }
     }
 
@@ -324,6 +344,7 @@ impl FileViewer {
         let request = self.next_request;
         self.open = Some(ViewerCore::new(chat_id.clone(), path.clone(), request));
         self.scroll.set_offset(gpui::Point::default());
+        self.clear_editor();
 
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.apply(
@@ -361,6 +382,7 @@ impl FileViewer {
         if let Some(core) = self.open.as_mut()
             && core.apply(request, result)
         {
+            self.refresh_editor(cx);
             cx.notify();
         }
     }
@@ -369,6 +391,7 @@ impl FileViewer {
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         if self.open.take().is_some() {
             self.task = None;
+            self.clear_editor();
             cx.notify();
         }
     }
@@ -399,17 +422,186 @@ impl FileViewer {
         }
     }
 
-    fn render_header(&self, path: &SharedString, cx: &mut Context<Self>) -> AnyElement {
+    fn clear_editor(&mut self) {
+        self.editor = None;
+        self.highlight_task = None;
+        self.list.reset(0);
+    }
+
+    fn refresh_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(core) = self.open.as_ref() else {
+            self.clear_editor();
+            return;
+        };
+        let ViewerBody::Text(text) = &core.body else {
+            self.clear_editor();
+            return;
+        };
+        let request = core.request;
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|buffer| buffer.request == request)
+        {
+            return;
+        }
+        let path = core.path.to_string();
+        let text = text.clone();
+        let lines = Arc::new(split_editor_lines(&text));
+        self.list.reset(lines.len() + 1);
+        self.editor = Some(EditorBuffer {
+            request,
+            lines,
+            highlight: None,
+        });
+        self.kick_highlight(path, text, request, cx);
+    }
+
+    fn kick_highlight(
+        &mut self,
+        path: String,
+        text: SharedString,
+        request: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if zeron_syntax::language_for_path(&path).is_none() {
+            return;
+        }
+        self.highlight_task = Some(cx.spawn(async move |this, cx| {
+            let document = cx
+                .background_executor()
+                .spawn(async move {
+                    zeron_syntax::highlight(HighlightRequest {
+                        source: &text,
+                        path: Some(&path),
+                        fence_tag: None,
+                    })
+                    .ok()
+                    .map(Arc::new)
+                })
+                .await;
+            this.update(cx, |viewer, cx| {
+                if let Some(buffer) = viewer.editor.as_mut()
+                    && buffer.request == request
+                {
+                    buffer.highlight = document;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn render_editor_row(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(buffer) = self.editor.as_ref() else {
+            return gpui::Empty.into_any_element();
+        };
+        let line_count = buffer.lines.len();
+        if ix >= line_count {
+            return div()
+                .h(px(16.0 + self.chrome_inset.get()))
+                .into_any_element();
+        }
         let theme = Theme::of(cx).clone();
+        let line = buffer.lines[ix].clone();
+        let spans = buffer
+            .highlight
+            .as_ref()
+            .and_then(|document| document.lines.get(ix))
+            .cloned()
+            .unwrap_or_default();
+        let request = buffer.request;
+        let gutter_w = gutter_px(line_count);
+        let mono = font(theme.font_mono.clone());
+        let runs =
+            render::runs_for_syntax_line_with_plain(&line, &spans, &mono, theme.text, &theme);
+        let styled = StyledText::new(line.clone()).with_runs(runs);
+        let code = if line.is_empty() {
+            div().into_any_element()
+        } else {
+            render::selectable_styled_text(
+                format!("file-viewer-{request}:{ix}").into(),
+                styled,
+                line,
+                &theme,
+            )
+        };
+        div()
+            .h(px(EDITOR_LINE_HEIGHT))
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .hover(|s| s.bg(crate::theme::ink(0.04)))
+            .child(
+                div()
+                    .w(px(gutter_w))
+                    .flex_none()
+                    .h_full()
+                    .flex()
+                    .justify_end()
+                    .items_center()
+                    .pr(px(10.0))
+                    .cursor(CursorStyle::Arrow)
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(11.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(format!("{}", ix + 1))),
+            )
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h_full()
+                    .flex_none()
+                    .bg(theme.border.opacity(0.65)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .pl(px(12.0))
+                    .pr(px(12.0))
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(render::CODE_TEXT_SIZE))
+                    .line_height(px(EDITOR_LINE_HEIGHT))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .child(code),
+            )
+            .into_any_element()
+    }
+
+    fn render_header(
+        &self,
+        path: &SharedString,
+        body: &ViewerBody,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let (dir, name) = split_display_path(path);
+        let kind = match body {
+            ViewerBody::Markdown(_) => Some("Markdown"),
+            ViewerBody::Text(_) => Some(language_label(path)),
+            ViewerBody::Loading | ViewerBody::Notice { .. } => None,
+        };
+        let lines = self.editor.as_ref().map(|buffer| buffer.lines.len());
         div()
             .flex_none()
-            .h(px(36.0))
+            .h(px(40.0))
             .w_full()
             .px(px(12.0))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(8.0))
+            .cursor(CursorStyle::Arrow)
+            .bg(crate::theme::ink(0.03))
             .border_b_1()
             .border_color(theme.border)
             .child(
@@ -421,11 +613,41 @@ impl FileViewer {
                 div()
                     .flex_1()
                     .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .gap(px(6.0))
                     .overflow_hidden()
-                    .text_size(px(12.5))
-                    .text_color(theme.text_muted)
-                    .child(path.clone()),
+                    .when_some(dir, |el, dir| {
+                        el.child(
+                            div()
+                                .overflow_hidden()
+                                .text_size(px(11.5))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(dir.to_string())),
+                        )
+                    })
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(SharedString::from(name.to_string())),
+                    ),
             )
+            .children(kind.map(|kind| header_chip(&theme, kind)))
+            .children(lines.map(|n| {
+                header_chip(
+                    &theme,
+                    if n == 1 {
+                        "1 line".to_string()
+                    } else {
+                        format!("{n} lines")
+                    },
+                )
+            }))
+            .child(header_chip(&theme, "Read-only"))
             .child(
                 div()
                     .id("file-viewer-close")
@@ -494,6 +716,8 @@ impl FileViewer {
                 let entity = cx.weak_entity();
                 let opts = RenderOptions {
                     tufte: crate::appearance::markdown_serif(cx),
+                    select_code: true,
+                    select_pad_x: CHAT_GUTTER,
                     on_link: Some(Rc::new(move |target: &str, _window, cx| {
                         let target = target.to_string();
                         entity
@@ -508,6 +732,7 @@ impl FileViewer {
                         .size_full()
                         .overflow_y_scroll()
                         .track_scroll(&self.scroll)
+                        .cursor(CursorStyle::IBeam)
                         .px(px(4.0))
                         .pt(px(16.0))
                         .pb(px(16.0 + inset))
@@ -515,27 +740,27 @@ impl FileViewer {
                     inset,
                 )
             }
-            // One shaped text element preserves newlines while bounding GPUI
-            // element count independently of line count. A 512 KiB file made
-            // from one-character lines therefore remains one content element,
-            // not hundreds of thousands.
-            ViewerBody::Text(text) => self.fade_under_chrome(
+            // Virtualized source view: line numbers, paint-only syntax, a
+            // per-row hover wash — a read-only editor, not a blob of
+            // monospace. Visible rows only materialize so a 512 KiB file
+            // of one-character lines stays cheap.
+            ViewerBody::Text(_) => crate::edge_fade::edge_faded(
+                Theme::TRANSCRIPT_FADE_BAND,
+                false,
+                true,
                 div()
                     .id("file-viewer-text")
                     .size_full()
-                    .overflow_scroll()
-                    .track_scroll(&self.scroll)
-                    .px(px(4.0))
-                    .pt(px(16.0))
-                    .pb(px(16.0 + inset))
-                    .font_family(theme.font_mono.clone())
-                    .text_size(px(render::CODE_TEXT_SIZE))
-                    .line_height(px(render::CODE_LINE_HEIGHT))
-                    .text_color(theme.text)
-                    .whitespace_nowrap()
-                    .child(text.clone()),
-                inset,
-            ),
+                    .bg(crate::theme::ink(0.025))
+                    .cursor(CursorStyle::IBeam)
+                    .child(
+                        list(self.list.clone(), cx.processor(Self::render_editor_row))
+                            .size_full()
+                            .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
+                    ),
+            )
+            .band_bottom((inset - Theme::STATUS_STRIP_HEIGHT).max(1.0))
+            .into_any_element(),
             ViewerBody::Notice { title, detail } => div()
                 .size_full()
                 .flex()
@@ -570,6 +795,78 @@ impl FileViewer {
     }
 }
 
+fn header_chip(theme: &Theme, label: impl Into<SharedString>) -> AnyElement {
+    div()
+        .flex_none()
+        .h(px(20.0))
+        .px(px(7.0))
+        .rounded(px(5.0))
+        .bg(crate::theme::ink(0.07))
+        .flex()
+        .items_center()
+        .text_size(px(10.5))
+        .text_color(theme.text_muted)
+        .child(label.into())
+        .into_any_element()
+}
+
+fn split_display_path(path: &str) -> (Option<&str>, &str) {
+    let path = path.trim_end_matches(['/', '\\']);
+    if path.is_empty() {
+        return (None, path);
+    }
+    path.rsplit_once('/')
+        .or_else(|| path.rsplit_once('\\'))
+        .map(|(dir, name)| (Some(dir), name))
+        .unwrap_or((None, path))
+}
+
+fn split_editor_lines(text: &str) -> Vec<SharedString> {
+    text.split('\n')
+        .map(|line| SharedString::from(line.to_string()))
+        .collect()
+}
+
+fn gutter_px(line_count: usize) -> f32 {
+    let digits = ((line_count.max(1) as f32).log10().floor() as usize) + 1;
+    (18.0 + digits as f32 * 7.5).max(EDITOR_GUTTER_MIN)
+}
+
+fn language_label(path: &str) -> &'static str {
+    use LanguageId::*;
+    match zeron_syntax::language_for_path(path) {
+        Some(Rust) => "Rust",
+        Some(JavaScript) => "JavaScript",
+        Some(Jsx) => "JSX",
+        Some(TypeScript) => "TypeScript",
+        Some(Tsx) => "TSX",
+        Some(Python) => "Python",
+        Some(Go) => "Go",
+        Some(Json) => "JSON",
+        Some(Jsonc) => "JSONC",
+        Some(Bash) => "Shell",
+        Some(Toml) => "TOML",
+        Some(Markdown) => "Markdown",
+        Some(Html) => "HTML",
+        Some(Css) => "CSS",
+        Some(Yaml) => "YAML",
+        Some(C) => "C",
+        Some(Cpp) => "C++",
+        Some(CSharp) => "C#",
+        Some(Java) => "Java",
+        Some(Kotlin) => "Kotlin",
+        Some(Swift) => "Swift",
+        Some(Ruby) => "Ruby",
+        Some(Php) => "PHP",
+        Some(Sql) => "SQL",
+        Some(Lua) => "Lua",
+        Some(Dockerfile) => "Dockerfile",
+        Some(Nix) => "Nix",
+        Some(Make) => "Make",
+        None => "Plain Text",
+    }
+}
+
 impl Render for FileViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
@@ -580,8 +877,34 @@ impl Render for FileViewer {
         else {
             return div().into_any_element();
         };
-        let header = self.render_header(&path, cx);
+        let header = self.render_header(&path, &body, cx);
+        let article = matches!(body, ViewerBody::Markdown(_));
         let body = self.render_body(&body, request, window, cx);
+        let pane = if article {
+            div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .flex()
+                .justify_center()
+                .px(px(CHAT_GUTTER))
+                .child(
+                    div()
+                        .h_full()
+                        .w_full()
+                        .max_w(px(MAX_CONTENT_WIDTH))
+                        .min_w_0()
+                        .child(body),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(body)
+                .into_any_element()
+        };
         div()
             .size_full()
             .flex()
@@ -591,26 +914,14 @@ impl Render for FileViewer {
             .border_color(theme.border)
             .id("file-viewer")
             .occlude()
+            .cursor(CursorStyle::IBeam)
+            // FIRST child, so it paints first: drop the transcript's
+            // selection registry before this file's text re-registers.
+            // Otherwise a drag hits the hidden chat rows whose glyph
+            // bounds still occupy these window coordinates.
+            .child(render::selection_frame_reset())
             .child(header)
-            .child(
-                // Pane is full width; only the page type sits in the chat's
-                // 46rem column so a markdown file doesn't stretch to the edges.
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .flex()
-                    .justify_center()
-                    .px(px(CHAT_GUTTER))
-                    .child(
-                        div()
-                            .h_full()
-                            .w_full()
-                            .max_w(px(MAX_CONTENT_WIDTH))
-                            .min_w_0()
-                            .child(body),
-                    ),
-            )
+            .child(pane)
             .into_any_element()
     }
 }
@@ -717,6 +1028,21 @@ mod tests {
             body_for("src/lib.rs", text("fn main() {}")),
             ViewerBody::Text(_)
         ));
+    }
+
+    #[test]
+    fn editor_lines_keep_a_trailing_blank() {
+        assert_eq!(split_editor_lines("fn main() {}").len(), 1);
+        assert_eq!(split_editor_lines("a\nb").len(), 2);
+        assert_eq!(split_editor_lines("a\nb\n").len(), 3);
+        assert_eq!(
+            split_display_path("crates/ui/src/lib.rs"),
+            (Some("crates/ui/src"), "lib.rs")
+        );
+        assert_eq!(split_display_path("README"), (None, "README"));
+        assert_eq!(language_label("src/lib.rs"), "Rust");
+        assert_eq!(language_label("notes.txt"), "Plain Text");
+        assert!(gutter_px(9) <= gutter_px(100));
     }
 
     #[test]
