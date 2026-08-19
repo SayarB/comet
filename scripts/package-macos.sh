@@ -52,6 +52,12 @@ else
   codesign --deep --force --sign - "$APP"
 fi
 
+# Local install helper (`scripts/install-macos-app.sh`) stops here — no dmg/tarball.
+if [[ "${ZERON_PACKAGE_APP_ONLY:-}" == 1 ]]; then
+  echo "packaged: $APP"
+  exit 0
+fi
+
 # notarize <path>: submit to Apple and wait for the verdict. A rejection may
 # still exit 0 depending on the notarytool version — the `stapler staple` that
 # follows each call has no ticket to attach then, and fails the build for us.
